@@ -1,0 +1,132 @@
+@import 'tailwindcss/base';
+@import 'tailwindcss/components';
+@import 'tailwindcss/utilities';
+
+@layer base {
+  html {
+    font-family: 'Inter', system-ui, sans-serif;
+  }
+  
+  body {
+    @apply bg-gray-900 text-gray-100;
+  }
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-900 transition-all duration-200;
+  }
+  
+  .btn-primary {
+    @apply btn bg-blue-600 text-white hover:bg-blue-700 focus:ring-blue-500;
+  }
+  
+  .btn-secondary {
+    @apply btn bg-gray-700 text-gray-100 hover:bg-gray-600 focus:ring-gray-500 border-gray-600;
+  }
+  
+  .btn-success {
+    @apply btn bg-green-600 text-white hover:bg-green-700 focus:ring-green-500;
+  }
+  
+  .btn-warning {
+    @apply btn bg-yellow-600 text-white hover:bg-yellow-700 focus:ring-yellow-500;
+  }
+  
+  .btn-error {
+    @apply btn bg-red-600 text-white hover:bg-red-700 focus:ring-red-500;
+  }
+  
+  .card {
+    @apply bg-gray-800 rounded-lg shadow-lg border border-gray-700 overflow-hidden;
+  }
+  
+  .card-header {
+    @apply px-6 py-4 border-b border-gray-700 bg-gray-800;
+  }
+  
+  .card-body {
+    @apply px-6 py-4;
+  }
+  
+  .status-badge {
+    @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium;
+  }
+  
+  .status-pending {
+    @apply status-badge bg-yellow-900 text-yellow-300 border border-yellow-600;
+  }
+  
+  .status-running {
+    @apply status-badge bg-blue-900 text-blue-300 border border-blue-600;
+  }
+  
+  .status-completed {
+    @apply status-badge bg-green-900 text-green-300 border border-green-600;
+  }
+  
+  .status-failed {
+    @apply status-badge bg-red-900 text-red-300 border border-red-600;
+  }
+  
+  .status-paused {
+    @apply status-badge bg-gray-700 text-gray-300 border border-gray-600;
+  }
+  
+  .input {
+    @apply block w-full px-3 py-2 border border-gray-600 rounded-md shadow-sm placeholder-gray-400 focus:outline-none focus:ring-blue-500 focus:border-blue-500 bg-gray-800 text-gray-100;
+  }
+  
+  .label {
+    @apply block text-sm font-medium text-gray-300 mb-1;
+  }
+  
+  .sidebar {
+    @apply bg-gray-900 border-gray-700;
+  }
+  
+  .nav-item {
+    @apply text-gray-300 hover:bg-gray-800 hover:text-white;
+  }
+  
+  .nav-item.router-link-active {
+    @apply bg-blue-900 text-blue-300 border-r-2 border-blue-500;
+  }
+}
+
+.fade-enter-active, .fade-leave-active {
+  transition: opacity 0.3s ease;
+}
+
+.fade-enter-from, .fade-leave-to {
+  opacity: 0;
+}
+
+.slide-enter-active, .slide-leave-active {
+  transition: transform 0.3s ease;
+}
+
+.slide-enter-from {
+  transform: translateX(-100%);
+}
+
+.slide-leave-to {
+  transform: translateX(100%);
+}
+
+/* Custom scrollbar para tema oscuro */
+::-webkit-scrollbar {
+  width: 8px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-gray-800;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-gray-600 rounded;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-gray-500;
+}

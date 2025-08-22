@@ -1,0 +1,19 @@
+{
+  "blender": {
+    "path": "C:\\Program Files\\Blender Foundation\\Blender 4.5\\blender.exe",
+    "auto_detect": true,
+    "custom_path": "C:\\Program Files\\Blender Foundation\\Blender 4.5\\blender.exe",
+    "version": "4.5.2",
+    "last_verified": "2025-08-22T11:44:28.057620"
+  },
+  "render": {
+    "default_engine": "CYCLES",
+    "max_concurrent_jobs": 3,
+    "auto_cleanup": true,
+    "default_output_format": "PNG"
+  },
+  "system": {
+    "check_updates": true,
+    "telemetry": false
+  }
+}
