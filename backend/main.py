@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 import os
@@ -15,7 +15,9 @@ import platform
 import psutil
 import sys
 import re
-from datetime import datetime
+import zipfile
+from io import BytesIO
+from datetime import datetime, timedelta
 from typing import List, Optional, Dict
 from pydantic import BaseModel
 from pathlib import Path
@@ -89,6 +91,22 @@ class BlenderConfigUpdate(BaseModel):
     timeout: int = 300
     max_memory_mb: int = 4096
     auto_detect: bool = True
+
+class NodeInfo(BaseModel):
+    node_id: str
+    node_name: str
+    status: str  # idle, busy, offline, error
+    last_seen: datetime
+    system_stats: Dict
+    active_jobs: int
+    capabilities: Dict
+    node_info: Dict
+
+class JobAssignment(BaseModel):
+    job_id: str
+    node_id: str
+    assigned_at: datetime
+    status: str
 
 # ==================== CONFIGURACIÓN ====================
 
@@ -382,6 +400,150 @@ def verify_blender_path(path: str) -> Dict:
             "version": None
         }
 
+def get_blend_file_info(blend_file_path: str) -> Dict:
+    """Extraer información del archivo .blend usando Blender"""
+    try:
+        current_blender = get_current_blender_path()
+        if not current_blender:
+            return {"error": "Blender no está configurado"}
+        
+        # Script Python para extraer información de la escena
+        python_script = '''
+import bpy
+import json
+import sys
+import os
+
+try:
+    # Obtener información de la escena
+    scene = bpy.context.scene
+    
+    # Obtener configuración de output
+    render = scene.render
+    output_path = render.filepath
+    
+    # Si el path es relativo, convertirlo a absoluto basado en el archivo .blend
+    if output_path.startswith('//'):
+        blend_dir = os.path.dirname(bpy.data.filepath)
+        output_path = os.path.join(blend_dir, output_path[2:])
+        output_path = os.path.normpath(output_path)
+    
+    info = {
+        "frame_start": scene.frame_start,
+        "frame_end": scene.frame_end,
+        "frame_current": scene.frame_current,
+        "fps": scene.render.fps,
+        "fps_base": scene.render.fps_base,
+        "render_engine": scene.render.engine,
+        "resolution_x": scene.render.resolution_x,
+        "resolution_y": scene.render.resolution_y,
+        "resolution_percentage": scene.render.resolution_percentage,
+        "file_format": scene.render.image_settings.file_format.lower(),
+        "samples": getattr(scene.cycles, 'samples', scene.render.engine == 'CYCLES' and 128 or 0),
+        "scene_name": scene.name,
+        "total_frames": (scene.frame_end - scene.frame_start) + 1,
+        "output_path": output_path,
+        "output_format": render.image_settings.file_format,
+        "color_mode": render.image_settings.color_mode,
+        "color_depth": render.image_settings.color_depth,
+        "compression": getattr(render.image_settings, 'compression', 15),
+        "quality": getattr(render.image_settings, 'quality', 90)
+    }
+    
+    print("BLEND_INFO_START")
+    print(json.dumps(info, indent=2))
+    print("BLEND_INFO_END")
+    
+except Exception as e:
+    print(f"ERROR_EXTRACTING_INFO: {str(e)}")
+'''
+        
+        # Comando para ejecutar Blender con el script
+        cmd = [
+            current_blender,
+            "-b",  # Background mode
+            blend_file_path,
+            "--python-expr", python_script
+        ]
+        
+        print(f"🔍 Extrayendo información de: {blend_file_path}")
+        
+        # Ejecutar comando
+        if platform.system() == "Windows":
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+        else:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        
+        if result.returncode != 0:
+            return {"error": f"Error ejecutando Blender: {result.stderr}"}
+        
+        # Extraer información del output
+        output = result.stdout
+        
+        # Buscar la información entre los marcadores
+        start_marker = "BLEND_INFO_START"
+        end_marker = "BLEND_INFO_END"
+        
+        if start_marker in output and end_marker in output:
+            start_idx = output.find(start_marker) + len(start_marker)
+            end_idx = output.find(end_marker)
+            json_str = output[start_idx:end_idx].strip()
+            
+            try:
+                info = json.loads(json_str)
+                print(f"📊 Información extraída: {info['total_frames']} frames ({info['frame_start']}-{info['frame_end']})")
+                print(f"📁 Output configurado: {info.get('output_path', 'Default')}")
+                return info
+            except json.JSONDecodeError as e:
+                return {"error": f"Error parseando información: {str(e)}"}
+        else:
+            return {"error": "No se pudo extraer información del archivo"}
+            
+    except subprocess.TimeoutExpired:
+        return {"error": "Timeout extrayendo información del archivo"}
+    except Exception as e:
+        return {"error": f"Error inesperado: {str(e)}"}
+
+def estimate_render_time(blend_info: Dict) -> str:
+    """Estimar tiempo de render basado en configuración"""
+    total_frames = blend_info.get("total_frames", 1)
+    samples = blend_info.get("samples", 128)
+    resolution_x = blend_info.get("resolution_x", 1920)
+    resolution_y = blend_info.get("resolution_y", 1080)
+    render_engine = blend_info.get("render_engine", "CYCLES")
+    
+    # Factores de estimación (muy aproximados)
+    base_time_per_frame = 30  # segundos base por frame
+    
+    # Ajustar según motor de render
+    if render_engine == "CYCLES":
+        base_time_per_frame *= (samples / 128)  # Factor por samples
+    elif render_engine == "EEVEE":
+        base_time_per_frame *= 0.3  # Eevee es mucho más rápido
+    elif render_engine == "WORKBENCH":
+        base_time_per_frame *= 0.1  # Workbench es muy rápido
+    
+    # Ajustar según resolución
+    resolution_factor = (resolution_x * resolution_y) / (1920 * 1080)
+    base_time_per_frame *= resolution_factor
+    
+    total_seconds = total_frames * base_time_per_frame
+    
+    if total_seconds < 60:
+        return f"~{int(total_seconds)} segundos"
+    elif total_seconds < 3600:
+        return f"~{int(total_seconds/60)} minutos"
+    else:
+        hours = int(total_seconds / 3600)
+        minutes = int((total_seconds % 3600) / 60)
+        return f"~{hours}h {minutes}m"
+
 def find_blender_executable():
     """Obtener ejecutable de Blender usando configuración"""
     return get_current_blender_path()
@@ -430,6 +592,14 @@ nodes_db = {
 # Almacén temporal para chunks
 upload_sessions: Dict[str, dict] = {}
 
+
+# ==================== BASE DE DATOS EN MEMORIA EXTENDIDA ====================
+
+# Base de datos de nodos registrados
+nodes_registry: Dict[str, NodeInfo] = {}
+
+#
+
 # ==================== FUNCIONES DE RENDER ====================
 
 async def render_job_background(job_id: str):
@@ -454,8 +624,6 @@ async def render_job_background(job_id: str):
         nodes_db["local"]["memory_usage"] = system_stats["memory_usage"]
         
         blend_file = job["file_path"]
-        output_dir = OUTPUT_DIR / job_id
-        output_dir.mkdir(exist_ok=True)
         
         # Verificar que el archivo existe
         if not os.path.exists(blend_file):
@@ -466,25 +634,57 @@ async def render_job_background(job_id: str):
         if not current_blender:
             raise Exception("Blender no está configurado o no se encuentra")
         
-        # Configurar comando de Blender para animación
-        output_pattern = str(output_dir / "frame_####")
+        # Obtener información del archivo .blend para usar su configuración
+        blend_info = get_blend_file_info(blend_file)
+        
         frame_start = job.get("frame_start", 1)
         frame_end = job.get("frame_end", 1)
         total_frames = (frame_end - frame_start) + 1
         
+        # Decidir dónde guardar los renders
+        use_blend_output = blend_info and "output_path" in blend_info and blend_info["output_path"]
+        
+        if use_blend_output:
+            # Usar la configuración de output del archivo .blend
+            print(f"📁 Usando output configurado en .blend: {blend_info['output_path']}")
+            
+            # El comando de Blender usará la configuración interna del archivo
+            # No necesitamos especificar -o ya que usará la configuración del .blend
+            cmd = [
+                current_blender,
+                "-b",  # Background mode
+                blend_file,
+                "-s", str(frame_start),  # Frame inicial
+                "-e", str(frame_end),    # Frame final
+                "-a"  # Render animación completa
+            ]
+            
+            # Determinar directorio de output para seguimiento
+            output_dir = Path(blend_info["output_path"]).parent
+            if not output_dir.exists():
+                output_dir.mkdir(parents=True, exist_ok=True)
+            
+        else:
+            # Fallback: usar nuestro directorio por defecto
+            output_dir = OUTPUT_DIR / job_id
+            output_dir.mkdir(exist_ok=True)
+            output_pattern = str(output_dir / "frame_####")
+            
+            print(f"📁 Usando output por defecto: {output_pattern}")
+            
+            cmd = [
+                current_blender,
+                "-b",  # Background mode
+                blend_file,
+                "-o", output_pattern,
+                "-s", str(frame_start),  # Frame inicial
+                "-e", str(frame_end),    # Frame final
+                "-a"  # Render animación completa
+            ]
+        
+        job["output_path"] = str(output_dir)
+        
         print(f"🎬 Renderizando animación: frames {frame_start}-{frame_end} ({total_frames} frames)")
-        
-        # Comando para renderizar animación completa
-        cmd = [
-            current_blender,
-            "-b",  # Background mode
-            blend_file,
-            "-o", output_pattern,
-            "-s", str(frame_start),  # Frame inicial
-            "-e", str(frame_end),    # Frame final
-            "-a"  # Render animación completa
-        ]
-        
         print(f"🎬 Ejecutando comando: {' '.join(cmd)}")
         
         # Ejecutar Blender
@@ -508,68 +708,124 @@ async def render_job_background(job_id: str):
         
         # Monitorear progreso en tiempo real
         frames_completed = 0
+        last_saved_frame = None
         
         # Leer salida de Blender para obtener progreso real
         while True:
             # Verificar si fue cancelado
             if job["status"] == "cancelled":
                 process.terminate()
+                print(f"🛑 Render cancelado por el usuario: {job_id}")
                 return
             
             # Leer una línea de output
             output_line = process.stdout.readline()
             
             if output_line:
-                print(f"Blender output: {output_line.strip()}")
+                line = output_line.strip()
+                print(f"Blender output: {line}")
                 
-                # Buscar indicadores de progreso de frame
-                if "Saved:" in output_line or "Time:" in output_line:
-                    frames_completed += 1
-                    job["frames_rendered"] = frames_completed
-                    progress = min(int((frames_completed / total_frames) * 100), 99)
-                    job["progress"] = progress
-                    
-                    print(f"📈 Progreso: Frame {frames_completed}/{total_frames} ({progress}%)")
+                # Detectar cuando un frame se ha guardado exitosamente
+                if "Saved:" in line:
+                    # Extraer información del archivo guardado
+                    saved_file_match = re.search(r"'([^']+)'", line)
+                    if saved_file_match:
+                        saved_file_path = saved_file_match.group(1)
+                        print(f"📁 Archivo guardado: {saved_file_path}")
+                        
+                        # Extraer número de frame del nombre del archivo
+                        frame_match = re.search(r'(\d+)\.(?:png|jpg|jpeg|exr|tiff)', saved_file_path, re.IGNORECASE)
+                        if frame_match:
+                            saved_frame = int(frame_match.group(1))
+                            
+                            # Solo contar si es un frame nuevo
+                            if last_saved_frame is None or saved_frame != last_saved_frame:
+                                frames_completed += 1
+                                last_saved_frame = saved_frame
+                                job["frames_rendered"] = frames_completed
+                                
+                                # Calcular progreso basado en frames realmente guardados
+                                progress = min(int((frames_completed / total_frames) * 100), 99)
+                                job["progress"] = progress
+                                
+                                print(f"📈 Progreso REAL: Frame {frames_completed}/{total_frames} ({progress}%) - Guardado: {os.path.basename(saved_file_path)}")
                 
-                # Detectar errores
-                if "Error:" in output_line or "EXCEPTION" in output_line:
-                    print(f"❌ Error detectado en Blender: {output_line.strip()}")
+                # Detectar errores críticos
+                if "Error:" in line or "EXCEPTION" in line or "Traceback" in line:
+                    print(f"❌ Error crítico detectado: {line}")
             
             # Verificar si el proceso terminó
             if process.poll() is not None:
                 break
             
-            # Pequeña pausa para no sobrecargar
+            # Pequeña pausa para no sobrecargar CPU
             await asyncio.sleep(0.1)
         
         # Obtener salida final
         stdout, stderr = process.communicate()
         
         if process.returncode == 0:
-            # Verificar que se renderizaron los frames
-            rendered_files = list(output_dir.glob("frame_*.png")) + list(output_dir.glob("frame_*.jpg")) + list(output_dir.glob("frame_*.exr"))
+            # Buscar archivos renderizados en el directorio de output
+            common_extensions = ["*.png", "*.jpg", "*.jpeg", "*.exr", "*.tiff", "*.tif"]
+            rendered_files = []
+            
+            for ext in common_extensions:
+                rendered_files.extend(list(output_dir.glob(ext)))
+                rendered_files.extend(list(output_dir.glob("**/" + ext)))  # Búsqueda recursiva
+            
             actual_frames = len(rendered_files)
             
-            # Éxito
+            print(f"📂 Archivos encontrados en directorio: {actual_frames}")
+            print(f"📊 Archivos esperados: {total_frames}")
+            print(f"📁 Directorio de búsqueda: {output_dir}")
+            
+            # Actualizar con datos reales
             job["status"] = "completed"
             job["progress"] = 100
             job["frames_rendered"] = actual_frames
             job["completed_at"] = datetime.now()
             job["output_path"] = str(output_dir)
             
-            # Actualizar estadísticas
+            # Actualizar estadísticas de tiempo
             duration = job["completed_at"] - job["started_at"]
-            job["render_time"] = str(duration).split('.')[0]  # Sin microsegundos
+            job["render_time"] = str(duration).split('.')[0]
             
-            print(f"✅ Render completado para job {job_id}")
-            print(f"📊 Frames renderizados: {actual_frames}/{total_frames}")
+            # Información detallada del resultado
+            if actual_frames == total_frames:
+                print(f"✅ Render COMPLETADO exitosamente para job {job_id}")
+                print(f"🎬 {actual_frames} frames renderizados correctamente")
+                if rendered_files:
+                    print(f"📄 Primer archivo: {rendered_files[0].name}")
+                    print(f"📄 Último archivo: {rendered_files[-1].name}")
+            elif actual_frames > 0:
+                print(f"⚠️ Render PARCIALMENTE completado para job {job_id}")
+                print(f"🎬 {actual_frames}/{total_frames} frames renderizados")
+            else:
+                print(f"❌ No se renderizaron frames para job {job_id}")
+                job["status"] = "failed"
+                job["error_message"] = "No se generaron archivos de imagen"
+            
             print(f"⏱️ Tiempo total: {job['render_time']}")
+            print(f"📁 Directorio: {output_dir}")
             
         else:
-            # Error
+            # Error en el proceso de Blender
             job["status"] = "failed"
-            job["error_message"] = f"Blender error (code {process.returncode}): {stderr}"
-            print(f"❌ Error en render: {stderr}")
+            job["error_message"] = f"Blender terminó con error (código {process.returncode}): {stderr[:500]}"
+            print(f"❌ Error en render: código {process.returncode}")
+            print(f"🔍 Stderr: {stderr}")
+            
+            # Intentar contar frames parciales si los hay
+            partial_files = []
+            common_extensions = ["*.png", "*.jpg", "*.jpeg", "*.exr", "*.tiff", "*.tif"]
+            for ext in common_extensions:
+                partial_files.extend(list(output_dir.glob(ext)))
+            
+            if partial_files:
+                job["frames_rendered"] = len(partial_files)
+                print(f"📊 Frames parciales encontrados: {len(partial_files)}")
+            else:
+                job["frames_rendered"] = 0
     
     except subprocess.TimeoutExpired:
         job["status"] = "failed"
@@ -589,6 +845,228 @@ async def render_job_background(job_id: str):
         nodes_db["local"]["current_job"] = None
         nodes_db["local"]["cpu_usage"] = system_stats["cpu_usage"]
         nodes_db["local"]["memory_usage"] = system_stats["memory_usage"]
+
+# ==================== ENDPOINTS PRINCIPALES ====================
+
+@app.post("/api/v1/blend/analyze")
+async def analyze_blend_file(file: UploadFile = File(...)):
+    """Analizar archivo .blend y extraer información de frames"""
+    
+    if not file.filename.endswith('.blend'):
+        raise HTTPException(status_code=400, detail="Solo se permiten archivos .blend")
+    
+    # Guardar archivo temporal
+    temp_file_path = TEMP_DIR / f"temp_{uuid.uuid4()}_{file.filename}"
+    
+    try:
+        # Guardar archivo
+        with open(temp_file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        # Extraer información
+        blend_info = get_blend_file_info(str(temp_file_path))
+        
+        if "error" in blend_info:
+            raise HTTPException(status_code=400, detail=blend_info["error"])
+        
+        return {
+            "filename": file.filename,
+            "file_size": temp_file_path.stat().st_size,
+            "blend_info": blend_info,
+            "recommended_settings": {
+                "frame_start": blend_info["frame_start"],
+                "frame_end": blend_info["frame_end"],
+                "render_engine": blend_info["render_engine"],
+                "total_frames": blend_info["total_frames"],
+                "estimated_time": estimate_render_time(blend_info)
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error analizando archivo: {str(e)}")
+    finally:
+        # Limpiar archivo temporal
+        if temp_file_path.exists():
+            os.remove(temp_file_path)
+
+@app.get("/api/v1/jobs/{job_id}/download")
+async def download_result(job_id: str, frame: Optional[int] = None):
+    """Descargar resultado del render - frame específico o primer frame"""
+    if job_id not in jobs_db:
+        raise HTTPException(status_code=404, detail="Trabajo no encontrado")
+    
+    job = jobs_db[job_id]
+    
+    if job["status"] != "completed":
+        raise HTTPException(status_code=400, detail="El trabajo no está completado")
+    
+    if not job["output_path"]:
+        raise HTTPException(status_code=404, detail="No se encontró resultado")
+    
+    # Buscar archivos de imagen con múltiples extensiones
+    output_dir = Path(job["output_path"])
+    common_extensions = ["*.png", "*.jpg", "*.jpeg", "*.exr", "*.tiff", "*.tif"]
+    image_files = []
+    
+    for ext in common_extensions:
+        image_files.extend(list(output_dir.glob(ext)))
+        image_files.extend(list(output_dir.glob("**/" + ext)))  # Búsqueda recursiva
+    
+    image_files = sorted(image_files)
+    
+    if not image_files:
+        raise HTTPException(status_code=404, detail="No se encontraron imágenes renderizadas")
+    
+    # Si se especifica un frame, buscar ese frame específico
+    if frame is not None:
+        frame_file = None
+        for img_file in image_files:
+            # Buscar diferentes patrones de numeración
+            frame_patterns = [
+                rf'{frame:04d}',  # 0001
+                rf'{frame:03d}',  # 001
+                rf'{frame:02d}',  # 01
+                rf'{frame}',      # 1
+            ]
+            
+            for pattern in frame_patterns:
+                if pattern in img_file.name:
+                    frame_file = img_file
+                    break
+            if frame_file:
+                break
+        
+        if not frame_file:
+            raise HTTPException(status_code=404, detail=f"Frame {frame} no encontrado")
+        
+        return FileResponse(
+            path=str(frame_file),
+            filename=f"render_{job_id}_frame_{frame:04d}{frame_file.suffix}",
+            media_type=f"image/{frame_file.suffix[1:]}" if frame_file.suffix else "image/png"
+        )
+    
+    # Si no se especifica frame, devolver el primer frame
+    return FileResponse(
+        path=str(image_files[0]),
+        filename=f"render_{job_id}_preview{image_files[0].suffix}",
+        media_type=f"image/{image_files[0].suffix[1:]}" if image_files[0].suffix else "image/png"
+    )
+
+@app.get("/api/v1/jobs/{job_id}/frames")
+async def get_job_frames(job_id: str):
+    """Obtener lista de todos los frames renderizados"""
+    if job_id not in jobs_db:
+        raise HTTPException(status_code=404, detail="Trabajo no encontrado")
+    
+    job = jobs_db[job_id]
+    
+    if job["status"] != "completed":
+        return {
+            "has_frames": False,
+            "status": job["status"],
+            "message": f"Trabajo en estado: {job['status']}"
+        }
+    
+    if not job["output_path"]:
+        return {
+            "has_frames": False,
+            "message": "No se encontró directorio de salida"
+        }
+    
+    # Buscar archivos de imagen con múltiples extensiones
+    output_dir = Path(job["output_path"])
+    common_extensions = ["*.png", "*.jpg", "*.jpeg", "*.exr", "*.tiff", "*.tif"]
+    image_files = []
+    
+    for ext in common_extensions:
+        image_files.extend(list(output_dir.glob(ext)))
+        image_files.extend(list(output_dir.glob("**/" + ext)))  # Búsqueda recursiva
+    
+    image_files = sorted(image_files)
+    
+    if not image_files:
+        return {
+            "has_frames": False,
+            "message": "No se encontraron imágenes renderizadas"
+        }
+    
+    # Extraer números de frame
+    frames = []
+    for img_file in image_files:
+        try:
+            # Extraer número de frame del nombre del archivo con diferentes patrones
+            frame_matches = re.findall(r'(\d+)', img_file.stem)
+            if frame_matches:
+                # Tomar el número más largo (probablemente el frame number)
+                frame_num = max(frame_matches, key=len)
+                frame_num = int(frame_num)
+                
+                frames.append({
+                    "frame_number": frame_num,
+                    "filename": img_file.name,
+                    "file_size": img_file.stat().st_size,
+                    "download_url": f"/api/v1/jobs/{job_id}/download?frame={frame_num}",
+                    "full_path": str(img_file)
+                })
+        except:
+            continue
+    
+    # Ordenar por número de frame
+    frames.sort(key=lambda x: x["frame_number"])
+    
+    return {
+        "has_frames": True,
+        "total_frames": len(frames),
+        "frame_start": job.get("frame_start", 1),
+        "frame_end": job.get("frame_end", 1),
+        "frames": frames,
+        "output_dir": str(output_dir),
+        "preview_url": f"/api/v1/jobs/{job_id}/download"  # Primer frame como preview
+    }
+
+@app.get("/api/v1/jobs/{job_id}/download-all")
+async def download_all_frames(job_id: str):
+    """Descargar todos los frames como ZIP"""
+    if job_id not in jobs_db:
+        raise HTTPException(status_code=404, detail="Trabajo no encontrado")
+    
+    job = jobs_db[job_id]
+    
+    if job["status"] != "completed":
+        raise HTTPException(status_code=400, detail="El trabajo no está completado")
+    
+    if not job["output_path"]:
+        raise HTTPException(status_code=404, detail="No se encontró resultado")
+    
+    # Buscar archivos de imagen
+    output_dir = Path(job["output_path"])
+    common_extensions = ["*.png", "*.jpg", "*.jpeg", "*.exr", "*.tiff", "*.tif"]
+    image_files = []
+    
+    for ext in common_extensions:
+        image_files.extend(list(output_dir.glob(ext)))
+        image_files.extend(list(output_dir.glob("**/" + ext)))
+    
+    if not image_files:
+        raise HTTPException(status_code=404, detail="No se encontraron imágenes renderizadas")
+    
+    # Crear ZIP en memoria
+    zip_buffer = BytesIO()
+    
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        for img_file in sorted(image_files):
+            # Usar path relativo al directorio de output para evitar paths absolutos en el ZIP
+            arcname = os.path.relpath(str(img_file), str(output_dir))
+            zip_file.write(img_file, arcname)
+    
+    zip_buffer.seek(0)
+    
+    # Devolver ZIP como respuesta
+    return StreamingResponse(
+        BytesIO(zip_buffer.read()),
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename=render_{job_id}_all_frames.zip"}
+    )
 
 # ==================== ENDPOINTS FALTANTES ====================
 
@@ -690,7 +1168,7 @@ async def test_blender_config(request: BlenderTestRequest):
 
 @app.post("/api/v1/config/blender/auto-detect")
 async def auto_detect_blender():
-    """Auto-detecta instalaciones de Blender en el sistema"""
+    """Auto-detecta instalaciones de Blender, recomienda la más reciente y devuelve la lista completa."""
     try:
         detected_versions = scan_for_blender()
         
@@ -705,31 +1183,40 @@ async def auto_detect_blender():
                 }
             }
         
-        # Si solo hay una versión válida, devolverla como seleccionada
-        valid_versions = [v for v in detected_versions if v.get("valid", False)]
+        # Filtrar solo versiones que son válidas y tienen un número de versión parseable
+        valid_versions = [
+            v for v in detected_versions 
+            if v.get("valid", False) and re.match(r'^\d+\.\d+\.\d+', v.get("version", ""))
+        ]
         
-        if len(valid_versions) == 1:
-            selected = valid_versions[0]
-            return {
-                "detected_versions": detected_versions,
-                "blender_path": selected["path"],
-                "verification": {
-                    "valid": True,
-                    "version": selected["version"],
-                    "error": None
-                }
-            }
-        else:
-            # Múltiples versiones o ninguna válida
+        if not valid_versions:
             return {
                 "detected_versions": detected_versions,
                 "blender_path": None,
                 "verification": {
                     "valid": False,
-                    "error": f"Se encontraron {len(valid_versions)} versiones válidas" if valid_versions else "No se encontraron versiones válidas",
+                    "error": "No se encontraron versiones válidas de Blender",
                     "version": None
                 }
             }
+        
+        # Encontrar la versión más reciente comparando los números de versión
+        # Convierte "4.5.2" a una tupla (4, 5, 2) para una comparación precisa
+        most_recent_version = max(
+            valid_versions, 
+            key=lambda v: tuple(map(int, v['version'].split('.')))
+        )
+        
+        return {
+            "detected_versions": detected_versions,
+            "blender_path": most_recent_version["path"],
+            "verification": {
+                "valid": True,
+                "version": most_recent_version["version"],
+                "error": None,
+                "message": f"Se recomienda la versión más reciente. Se encontraron {len(valid_versions)} versiones válidas."
+            }
+        }
             
     except Exception as e:
         print(f"Error auto-detecting Blender: {e}")
@@ -1223,152 +1710,6 @@ async def cancel_job(job_id: str):
         return {"message": f"Trabajo {job_id} cancelado"}
     else:
         raise HTTPException(status_code=400, detail="El trabajo no se puede cancelar")
-
-@app.get("/api/v1/jobs/{job_id}/download")
-async def download_result(job_id: str, frame: Optional[int] = None):
-    """Descargar resultado del render - frame específico o primer frame"""
-    if job_id not in jobs_db:
-        raise HTTPException(status_code=404, detail="Trabajo no encontrado")
-    
-    job = jobs_db[job_id]
-    
-    if job["status"] != "completed":
-        raise HTTPException(status_code=400, detail="El trabajo no está completado")
-    
-    if not job["output_path"]:
-        raise HTTPException(status_code=404, detail="No se encontró resultado")
-    
-    # Buscar archivos de imagen
-    output_dir = Path(job["output_path"])
-    image_files = sorted(list(output_dir.glob("frame_*.png")) + list(output_dir.glob("frame_*.jpg")) + list(output_dir.glob("frame_*.exr")))
-    
-    if not image_files:
-        raise HTTPException(status_code=404, detail="No se encontraron imágenes renderizadas")
-    
-    # Si se especifica un frame, buscar ese frame específico
-    if frame is not None:
-        frame_file = None
-        for img_file in image_files:
-            if f"frame_{frame:04d}" in img_file.name:
-                frame_file = img_file
-                break
-        
-        if not frame_file:
-            raise HTTPException(status_code=404, detail=f"Frame {frame} no encontrado")
-        
-        return FileResponse(
-            path=str(frame_file),
-            filename=f"render_{job_id}_frame_{frame:04d}.png",
-            media_type="image/png"
-        )
-    
-    # Si no se especifica frame, devolver el primer frame
-    return FileResponse(
-        path=str(image_files[0]),
-        filename=f"render_{job_id}_preview.png",
-        media_type="image/png"
-    )
-
-@app.get("/api/v1/jobs/{job_id}/frames")
-async def get_job_frames(job_id: str):
-    """Obtener lista de todos los frames renderizados"""
-    if job_id not in jobs_db:
-        raise HTTPException(status_code=404, detail="Trabajo no encontrado")
-    
-    job = jobs_db[job_id]
-    
-    if job["status"] != "completed":
-        return {
-            "has_frames": False,
-            "status": job["status"],
-            "message": f"Trabajo en estado: {job['status']}"
-        }
-    
-    if not job["output_path"]:
-        return {
-            "has_frames": False,
-            "message": "No se encontró directorio de salida"
-        }
-    
-    # Buscar archivos de imagen
-    output_dir = Path(job["output_path"])
-    image_files = sorted(list(output_dir.glob("frame_*.png")) + list(output_dir.glob("frame_*.jpg")) + list(output_dir.glob("frame_*.exr")))
-    
-    if not image_files:
-        return {
-            "has_frames": False,
-            "message": "No se encontraron imágenes renderizadas"
-        }
-    
-    # Extraer números de frame
-    frames = []
-    for img_file in image_files:
-        try:
-            # Extraer número de frame del nombre del archivo
-            import re
-            frame_match = re.search(r'frame_(\d+)', img_file.name)
-            if frame_match:
-                frame_num = int(frame_match.group(1))
-                frames.append({
-                    "frame_number": frame_num,
-                    "filename": img_file.name,
-                    "file_size": img_file.stat().st_size,
-                    "download_url": f"/api/v1/jobs/{job_id}/download?frame={frame_num}"
-                })
-        except:
-            continue
-    
-    return {
-        "has_frames": True,
-        "total_frames": len(frames),
-        "frame_start": job.get("frame_start", 1),
-        "frame_end": job.get("frame_end", 1),
-        "frames": frames,
-        "output_dir": str(output_dir),
-        "preview_url": f"/api/v1/jobs/{job_id}/download"  # Primer frame como preview
-    }
-
-@app.get("/api/v1/jobs/{job_id}/download-all")
-async def download_all_frames(job_id: str):
-    """Descargar todos los frames como ZIP"""
-    if job_id not in jobs_db:
-        raise HTTPException(status_code=404, detail="Trabajo no encontrado")
-    
-    job = jobs_db[job_id]
-    
-    if job["status"] != "completed":
-        raise HTTPException(status_code=400, detail="El trabajo no está completado")
-    
-    if not job["output_path"]:
-        raise HTTPException(status_code=404, detail="No se encontró resultado")
-    
-    # Buscar archivos de imagen
-    output_dir = Path(job["output_path"])
-    image_files = list(output_dir.glob("frame_*.png")) + list(output_dir.glob("frame_*.jpg")) + list(output_dir.glob("frame_*.exr"))
-    
-    if not image_files:
-        raise HTTPException(status_code=404, detail="No se encontraron imágenes renderizadas")
-    
-    # Crear ZIP en memoria
-    import zipfile
-    from io import BytesIO
-    
-    zip_buffer = BytesIO()
-    
-    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-        for img_file in sorted(image_files):
-            zip_file.write(img_file, img_file.name)
-    
-    zip_buffer.seek(0)
-    
-    # Devolver ZIP como respuesta
-    from fastapi.responses import StreamingResponse
-    
-    return StreamingResponse(
-        BytesIO(zip_buffer.read()),
-        media_type="application/zip",
-        headers={"Content-Disposition": f"attachment; filename=render_{job_id}_all_frames.zip"}
-    )
 
 @app.get("/api/v1/jobs/{job_id}/preview")
 async def get_job_preview(job_id: str):

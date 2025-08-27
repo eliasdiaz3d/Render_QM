@@ -1,7 +1,7 @@
 # app/api/v1/nodes.py - Endpoints para gestión de nodos distribuidos
-from typing import Dict, List, Optional, Any
-from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Query
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi import APIRouter, HTTPException, Query
+from typing import Dict, List, Optional
+from datetime import datetime, timedelta
 
 from app.models.node import (
     NodeRegistration, NodeHeartbeat, NodeResponse, NodeUpdate,
@@ -55,9 +55,6 @@ async def register_node_endpoint(node_data: NodeRegistration):
             }
         else:
             raise HTTPException(status_code=500, detail=f"Error consultando trabajo para nodo {node_id}: {str(e)}")
-    except Exception as e:
-    # manejo del error
-        pass
 
 @router.get("/jobs/{job_id}/download-blend")
 async def download_blend_file(job_id: str):
@@ -572,6 +569,9 @@ async def cleanup_nodes():
         }
         
     except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en limpieza de nodos: {str(e)}"="Error registrando nodo")
+            
+    except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error registrando nodo: {str(e)}")
 
 @router.post("/nodes/heartbeat")
@@ -678,4 +678,4 @@ async def poll_job_for_node(node_id: str):
         return None
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Error interno del servidor")
+        raise HTTPException(status_code=500, detail

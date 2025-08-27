@@ -626,34 +626,3 @@ def validate_database_integrity() -> Dict[str, Any]:
         "total_nodes": len(nodes_registry),
         "queue_length": len(distributed_job_queue)
     }
-
-# ==================== FUNCIÓN DE DEPENDENCIA PARA FASTAPI ====================
-
-def get_db():
-    """Función de dependencia para FastAPI - retorna el contexto de base de datos"""
-    # Como usas base de datos en memoria, puedes retornar un objeto simple
-    # que contenga referencias a las bases de datos globales
-    return {
-        "jobs_db": jobs_db,
-        "nodes_db": nodes_db,
-        "nodes_registry": nodes_registry,
-        "upload_sessions": upload_sessions,
-        "distributed_job_queue": distributed_job_queue,
-        "job_assignments": job_assignments,
-        "job_files_cache": job_files_cache,
-        "system_stats": system_stats
-    }
-
-# ==================== COMPATIBILIDAD CON SQLALCHEMY ====================
-from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
-
-# Base para modelos SQLAlchemy (para compatibilidad)
-Base = declarative_base()
-
-# Engine para SQLAlchemy (base de datos en memoria SQLite)
-engine = create_engine("sqlite:///:memory:", echo=False)
-
-# SessionLocal para crear sesiones de base de datos
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

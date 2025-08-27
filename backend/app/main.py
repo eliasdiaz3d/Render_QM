@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 
-from .api.v1 import jobs, nodes, queue, auth, notifications, settings
+from .api.v1 import jobs, nodes, queue, auth, notifications, settings, config
 from .core.database import engine, Base
 
 # Crear tablas
@@ -33,6 +33,7 @@ app.include_router(queue.router, prefix="/api/v1/queue", tags=["queue"])
 app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
 app.include_router(notifications.router, prefix="/api/v1/notifications", tags=["notifications"])
 app.include_router(settings.router, prefix="/api/v1/settings", tags=["settings"])
+app.include_router(config.router, prefix="/api/v1/config", tags=["config"])
 
 @app.get("/")
 async def root():
