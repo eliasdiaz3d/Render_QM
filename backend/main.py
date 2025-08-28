@@ -109,6 +109,15 @@ class JobAssignment(BaseModel):
     assigned_at: datetime
     status: str
 
+class NodeRegistration(BaseModel):
+    node_id: str
+    node_name: str
+    ip_address: str
+    cpu_cores: int
+    memory_gb: float
+    platform: str
+    blender_version: Optional[str] = None
+
 # ==================== CONFIGURACIÓN ====================
 
 # Configuración por defecto
@@ -1713,6 +1722,89 @@ async def get_job_preview(job_id: str):
         "total_frames": len(image_files),
         "output_dir": str(output_dir)
     }
+
+# ==================== RUTAS DE GESTIÓN DE NODOS ====================
+
+@app.post("/api/v1/nodes/register")
+async def register_node(node_data: Dict[str, Any]):
+    """Permite que un nuevo nodo avanzado se registre en el sistema."""
+    node_id = node_data.get("node_id")
+    if not node_id:
+        raise HTTPException(status_code=400, detail="Falta node_id")
+
+    node_name = node_data.get("node_name", "Nodo sin nombre")
+    
+    if node_id in nodes_db:
+        print(f"🖥️ Nodo {node_name} ({node_id[:8]}) se ha reconectado.")
+    else:
+        print(f"✅ Nuevo nodo avanzado registrado: {node_name} ({node_id[:8]})")
+    
+    # Guardar toda la información rica que envía el nodo
+    nodes_db[node_id] = {
+        "id": node_id,
+        "name": node_name,
+        "ip": node_data.get("node_info", {}).get("hostname", "N/A"),
+        "status": "idle", # Estado inicial
+        "last_seen": datetime.now(),
+        "node_info": node_data.get("node_info"),
+        "system_stats": node_data.get("system_stats"),
+        "config": node_data.get("config"),
+        "capabilities": node_data.get("capabilities"),
+        "current_job": None
+    }
+    return {"message": "Nodo registrado exitosamente", "node_id": node_id}
+
+
+@app.post("/api/v1/nodes/heartbeat")
+async def node_heartbeat(heartbeat_data: Dict[str, Any]):
+    """Recibe un heartbeat detallado de un nodo."""
+    node_id = heartbeat_data.get("node_id")
+    if not node_id or node_id not in nodes_db:
+        # Si el nodo no está, quizás el servidor se reinició. Le pedimos que se re-registre.
+        raise HTTPException(status_code=404, detail="Nodo no registrado. Por favor, regístrese de nuevo.")
+    
+    # Actualizar la información del nodo con los datos del heartbeat
+    nodes_db[node_id]["last_seen"] = datetime.now()
+    nodes_db[node_id]["status"] = heartbeat_data.get("status", "unknown")
+    nodes_db[node_id]["system_stats"] = heartbeat_data.get("system_stats")
+    
+    return {"message": "Heartbeat recibido"}
+
+
+@app.get("/api/v1/jobs/request")
+async def request_job(node_id: str = ""):
+    """Un nodo libre pide el siguiente trabajo disponible en la cola."""
+    if not node_id or node_id not in nodes_db:
+        raise HTTPException(status_code=403, detail="Petición de un nodo no válido o no registrado.")
+        
+    # Buscar el primer trabajo pendiente en la cola
+    pending_job = None
+    for job_id, job in jobs_db.items():
+        if job["status"] == "pending":
+            pending_job = job
+            break # Encontramos uno, salimos del bucle
+            
+    if pending_job:
+        # Marcar el trabajo como "asignado" para que otro nodo no lo tome
+        pending_job["status"] = "assigned"
+        pending_job["assigned_to"] = node_id
+        
+        # Actualizar el estado del nodo
+        nodes_db[node_id]["status"] = "busy"
+        nodes_db[node_id]["current_job"] = pending_job["id"]
+        
+        print(f"📦 Trabajo {pending_job['id']} asignado al nodo {node_id}")
+        
+        return {
+            "job_assigned": True,
+            "job": pending_job
+        }
+    else:
+        # No hay trabajos pendientes
+        return {"job_assigned": False, "message": "No hay trabajos pendientes en la cola."}
+
+
+
 
 # ==================== RUTAS DE ESTADO ====================
 
