@@ -79,6 +79,22 @@
           </div>
         </div>
 
+        <!-- ====================================================== -->
+        <!-- === 1. AÑADIDO: Campo de Email para Notificaciones === -->
+        <!-- ====================================================== -->
+        <div>
+          <label for="notification-email" class="block text-sm font-medium text-gray-300 mb-2">
+            ✉️ Email para Notificación (Opcional)
+          </label>
+          <input
+            type="email"
+            id="notification-email"
+            v-model="jobForm.notification_email"
+            placeholder="tu_correo@ejemplo.com"
+            class="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-white placeholder-gray-400 focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+          />
+        </div>
+
         <!-- Información de tiempo estimado -->
         <div v-if="blendInfo" class="bg-green-900/30 border border-green-500/30 rounded-lg p-4">
           <div class="flex items-start space-x-3">
@@ -301,11 +317,24 @@ export default {
         name: '',
         render_engine: 'CYCLES',
         frame_start: 1,
-        frame_end: 50
+        frame_end: 50,
+        // --- CAMBIO 2: Variable para el email en el formulario ---
+        notification_email: '' 
       },
+      selectedFile: null,
+      isUploading: false,
+      isAnalyzing: false,
+      uploadProgress: 0,
+      blendInfo: null,
+      estimatedRenderTime: ''
+    }
+  },
   computed: {
     totalFrames() {
-      return Math.max(1, (this.jobForm.frame_end - this.jobForm.frame_start) + 1);
+      if (this.jobForm.frame_end < this.jobForm.frame_start) {
+        return 0;
+      }
+      return (this.jobForm.frame_end - this.jobForm.frame_start) + 1;
     },
     estimatedTime() {
       const frames = this.totalFrames;
@@ -314,14 +343,6 @@ export default {
       if (frames <= 50) return '~15-30 minutos';
       if (frames <= 120) return '~45-90 minutos';
       return '~2+ horas';
-    }
-  },
-      selectedFile: null,
-      isUploading: false,
-      isAnalyzing: false,
-      uploadProgress: 0,
-      blendInfo: null,
-      estimatedRenderTime: ''
     }
   },
   methods: {
@@ -410,7 +431,9 @@ export default {
         name: '',
         render_engine: 'CYCLES',
         frame_start: 1,
-        frame_end: 50
+        frame_end: 50,
+        // --- AÑADIDO: Limpiar el email al resetear ---
+        notification_email: ''
       };
       this.clearFile();
       this.uploadProgress = 0;
@@ -457,6 +480,11 @@ export default {
         formData.append('frame_end', this.jobForm.frame_end);
         formData.append('render_engine', this.jobForm.render_engine);
         
+        // --- CAMBIO 3: Lógica para añadir el email al envío ---
+        if (this.jobForm.notification_email) {
+          formData.append('notification_email', this.jobForm.notification_email);
+        }
+
         // Enviar al backend
         const response = await fetch('http://localhost:8000/api/v1/jobs/upload', {
           method: 'POST',

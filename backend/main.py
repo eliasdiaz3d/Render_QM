@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTa
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from app.services.notification_service import notification_service
 import uvicorn
 import os
 import uuid
@@ -608,6 +609,9 @@ async def render_job_background(job_id: str):
         return
     
     job = jobs_db[job_id]
+    recipient_email = job.get("notification_email")
+    print(f"\n--- PASO 2: Iniciando Render para Job {job_id} ---")
+    print(f"📧 Intentando notificar a: '{recipient_email}'")
     
     try:
         # Actualizar estado a procesando
@@ -765,81 +769,54 @@ async def render_job_background(job_id: str):
         stdout, stderr = process.communicate()
         
         if process.returncode == 0:
-            # Buscar archivos renderizados en el directorio de output
-            common_extensions = ["*.png", "*.jpg", "*.jpeg", "*.exr", "*.tiff", "*.tif"]
-            rendered_files = []
-            
-            for ext in common_extensions:
-                rendered_files.extend(list(output_dir.glob(ext)))
-                rendered_files.extend(list(output_dir.glob("**/" + ext)))  # Búsqueda recursiva
-            
-            actual_frames = len(rendered_files)
-            
-            print(f"📂 Archivos encontrados en directorio: {actual_frames}")
-            print(f"📊 Archivos esperados: {total_frames}")
-            print(f"📁 Directorio de búsqueda: {output_dir}")
-            
-            # Actualizar con datos reales
             job["status"] = "completed"
-            job["progress"] = 100
-            job["frames_rendered"] = actual_frames
             job["completed_at"] = datetime.now()
-            job["output_path"] = str(output_dir)
-            
-            # Actualizar estadísticas de tiempo
-            duration = job["completed_at"] - job["started_at"]
-            job["render_time"] = str(duration).split('.')[0]
-            
-            # Información detallada del resultado
-            if actual_frames == total_frames:
-                print(f"✅ Render COMPLETADO exitosamente para job {job_id}")
-                print(f"🎬 {actual_frames} frames renderizados correctamente")
-                if rendered_files:
-                    print(f"📄 Primer archivo: {rendered_files[0].name}")
-                    print(f"📄 Último archivo: {rendered_files[-1].name}")
-            elif actual_frames > 0:
-                print(f"⚠️ Render PARCIALMENTE completado para job {job_id}")
-                print(f"🎬 {actual_frames}/{total_frames} frames renderizados")
+            print(f"✅ Render COMPLETADO exitosamente para job {job_id}")
+
+            print(f"\n--- PASO 3: Finalización de Job (Éxito) ---")
+            if recipient_email:
+                print(f"📧 Llamando al servicio de notificación para {recipient_email}...")
+                await notification_service.notify_job_completed(
+                    job_name=job["name"],
+                    output_path=str(job["output_path"]),
+                    recipient=recipient_email
+                )
             else:
-                print(f"❌ No se renderizaron frames para job {job_id}")
-                job["status"] = "failed"
-                job["error_message"] = "No se generaron archivos de imagen"
-            
-            print(f"⏱️ Tiempo total: {job['render_time']}")
-            print(f"📁 Directorio: {output_dir}")
-            
+                print("🤷‍♂️ No hay email de notificación configurado para este job.")
         else:
-            # Error en el proceso de Blender
             job["status"] = "failed"
-            job["error_message"] = f"Blender terminó con error (código {process.returncode}): {stderr[:500]}"
+            error_msg = f"Blender terminó con error (código {process.returncode}): {stderr[:500]}"
+            job["error_message"] = error_msg
             print(f"❌ Error en render: código {process.returncode}")
-            print(f"🔍 Stderr: {stderr}")
-            
-            # Intentar contar frames parciales si los hay
-            partial_files = []
-            common_extensions = ["*.png", "*.jpg", "*.jpeg", "*.exr", "*.tiff", "*.tif"]
-            for ext in common_extensions:
-                partial_files.extend(list(output_dir.glob(ext)))
-            
-            if partial_files:
-                job["frames_rendered"] = len(partial_files)
-                print(f"📊 Frames parciales encontrados: {len(partial_files)}")
+
+            print(f"\n--- PASO 3: Finalización de Job (Fallo) ---")
+            if recipient_email:
+                print(f"📧 Llamando al servicio de notificación para {recipient_email}...")
+                await notification_service.notify_job_failed(
+                    job_name=job["name"],
+                    error_message=error_msg,
+                    recipient=recipient_email
+                )
             else:
-                job["frames_rendered"] = 0
-    
-    except subprocess.TimeoutExpired:
-        job["status"] = "failed"
-        job["error_message"] = "Timeout: El render tardó demasiado tiempo"
-        if 'process' in locals():
-            process.kill()
-    
+                print("🤷‍♂️ No hay email de notificación configurado para este job.")
+
     except Exception as e:
         job["status"] = "failed"
         job["error_message"] = str(e)
         print(f"❌ Error en render: {e}")
+
+        print(f"\n--- PASO 3: Finalización de Job (Excepción) ---")
+        if recipient_email:
+            print(f"📧 Llamando al servicio de notificación para {recipient_email}...")
+            await notification_service.notify_job_failed(
+                job_name=job.get("name", "Desconocido"),
+                error_message=str(e),
+                recipient=recipient_email
+            )
+        else:
+            print("🤷‍♂️ No hay email de notificación configurado para este job.")
     
     finally:
-        # Liberar nodo con estadísticas actualizadas
         system_stats = get_system_stats()
         nodes_db["local"]["status"] = "online"
         nodes_db["local"]["current_job"] = None
@@ -1411,18 +1388,19 @@ async def upload_and_create_job(
     name: str = Form(...),
     frame_start: int = Form(1),
     frame_end: int = Form(1),
-    render_engine: str = Form("CYCLES")
+    render_engine: str = Form("CYCLES"),
+    notification_email: Optional[str] = Form(None)
 ):
     """Subir archivo .blend y crear trabajo de render"""
     
-    # Validar archivo
+    # --- DEBUG: Imprimir el email recibido del formulario ---
+    print(f"\n--- PASO 1: Recibiendo Job ---")
+    print(f"📧 Email de notificación recibido del frontend: '{notification_email}'")
+
     if not file.filename.endswith('.blend'):
         raise HTTPException(status_code=400, detail="Solo se permiten archivos .blend")
     
-    # Generar ID único
     job_id = str(uuid.uuid4())
-    
-    # Guardar archivo
     file_path = UPLOAD_DIR / f"{job_id}_{file.filename}"
     
     try:
@@ -1431,38 +1409,21 @@ async def upload_and_create_job(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al guardar archivo: {e}")
     
-    # Crear trabajo en la base de datos
     job = {
-        "id": job_id,
-        "name": name,
-        "status": "pending",
-        "progress": 0,
-        "created_at": datetime.now(),
-        "started_at": None,
-        "completed_at": None,
-        "file_path": str(file_path),
-        "original_filename": file.filename,
-        "output_path": None,
-        "frame_start": frame_start,
-        "frame_end": frame_end,
-        "frames_total": (frame_end - frame_start) + 1,
-        "frames_rendered": 0,
-        "render_engine": render_engine,
-        "estimated_time": None,
-        "error_message": None,
-        "file_size": file.size if hasattr(file, 'size') else 0
+        "id": job_id, "name": name, "status": "pending", "progress": 0,
+        "created_at": datetime.now(), "started_at": None, "completed_at": None,
+        "file_path": str(file_path), "original_filename": file.filename,
+        "output_path": None, "frame_start": frame_start, "frame_end": frame_end,
+        "frames_total": (frame_end - frame_start) + 1, "frames_rendered": 0,
+        "render_engine": render_engine, "estimated_time": None, "error_message": None,
+        "file_size": file.size if hasattr(file, 'size') else 0,
+        "notification_email": notification_email
     }
     
     jobs_db[job_id] = job
-    
-    # Iniciar render en background
     background_tasks.add_task(render_job_background, job_id)
     
-    return {
-        "message": "Archivo subido y trabajo creado exitosamente",
-        "job_id": job_id,
-        "job": job
-    }
+    return {"message": "Archivo subido y trabajo creado exitosamente", "job_id": job_id, "job": job}
 
 # ==================== RUTAS DE UPLOAD POR CHUNKS ====================
 

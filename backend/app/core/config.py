@@ -1,198 +1,90 @@
-# app/core/config.py - Configuración del sistema
-from pathlib import Path
-from typing import Dict, Any
+# D:\Render_QM\Render_QM\backend\app\core\config.py
+
 import json
-import logging
+from pathlib import Path
+from typing import Any, Dict
+from pydantic_settings import BaseSettings
 
-# Configurar logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Configuración por defecto
-DEFAULT_CONFIG = {
-    "blender": {
-        "path": None,
-        "auto_detect": True,
-        "custom_path": None,
-        "version": None,
-        "last_verified": None
-    },
-    "render": {
-        "default_engine": "CYCLES",
-        "max_concurrent_jobs": 3,
-        "auto_cleanup": True,
-        "default_output_format": "PNG"
-    },
-    "system": {
-        "check_updates": True,
-        "telemetry": False
-    },
-    "distributed": {
-        "enabled": True,
-        "max_nodes": 10,
-        "heartbeat_timeout": 30,
-        "job_timeout": 3600
-    }
-}
-
-def load_config(config_file: Path) -> Dict[str, Any]:
-    """Cargar configuración desde archivo"""
-    try:
-        if config_file.exists():
-            with open(config_file, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-                # Merge con configuración por defecto para nuevas opciones
-                return merge_configs(DEFAULT_CONFIG, config)
-        else:
-            return DEFAULT_CONFIG.copy()
-    except Exception as e:
-        logger.error(f"❌ Error cargando configuración: {e}")
-        return DEFAULT_CONFIG.copy()
-
-def save_config(config: Dict[str, Any], config_file: Path) -> bool:
-    """Guardar configuración a archivo"""
-    try:
-        with open(config_file, 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=2, ensure_ascii=False, default=str)
-        return True
-    except Exception as e:
-        logger.error(f"❌ Error guardando configuración: {e}")
-        return False
-
-def merge_configs(default: dict, user: dict) -> dict:
-    """Merge configuración del usuario con la por defecto"""
-    result = default.copy()
-    for key, value in user.items():
-        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-            result[key] = merge_configs(result[key], value)
-        else:
-            result[key] = value
-    return result
-
-class Settings:
-    """Clase de configuración singleton para el sistema"""
+# --- Paso 1: Clase para cargar secretos desde el archivo .env ---
+# Esta clase se encarga de las contraseñas, tokens y claves de API.
+class EnvSettings(BaseSettings):
+    # Variables para Email (leídas desde .env)
+    SMTP_SERVER: str = "smtp.gmail.com"
+    SMTP_PORT: int = 587
+    SMTP_USER: str | None = None
+    SMTP_PASSWORD: str | None = None
     
-    def __init__(self):
-        # Directorios base
+    # Variables para Twilio (leídas desde .env)
+    TWILIO_ACCOUNT_SID: str | None = None
+    TWILIO_AUTH_TOKEN: str | None = None
+    TWILIO_WHATSAPP_FROM: str | None = None
+    
+    # Variables para Telegram (leídas desde .env)
+    TELEGRAM_BOT_TOKEN: str | None = None
+
+    class Config:
+        # Le decimos a Pydantic que lea el archivo .env desde la carpeta raíz del backend
+        env_file = Path(__file__).parent.parent.parent / ".env"
+        env_file_encoding = 'utf-8'
+
+# --- Paso 2: Clase principal de configuración que combina todo ---
+class Settings:
+    def __init__(self, env_settings: EnvSettings):
+        # Cargar las credenciales desde la clase de entorno
+        self.smtp_server = env_settings.SMTP_SERVER
+        self.smtp_port = env_settings.SMTP_PORT
+        self.smtp_user = env_settings.SMTP_USER
+        self.smtp_password = env_settings.SMTP_PASSWORD
+        self.twilio_account_sid = env_settings.TWILIO_ACCOUNT_SID
+        self.twilio_auth_token = env_settings.TWILIO_AUTH_TOKEN
+        self.twilio_whatsapp_from = env_settings.TWILIO_WHATSAPP_FROM
+        self.telegram_bot_token = env_settings.TELEGRAM_BOT_TOKEN
+
+        # Cargar la configuración de la aplicación desde config.json
         self.BASE_DIR = Path(__file__).parent.parent.parent
-        self.UPLOAD_DIR = self.BASE_DIR / "uploads"
-        self.OUTPUT_DIR = self.BASE_DIR / "renders"
-        self.TEMP_DIR = self.BASE_DIR / "temp"
         self.CONFIG_FILE = self.BASE_DIR / "config.json"
         
-        # Cargar configuración
-        self.config = load_config(self.CONFIG_FILE)
-        
-        # Configuración de API
-        self.API_VERSION = "2.0.0"
-        self.API_TITLE = "Render Queue Manager API"
-        self.API_DESCRIPTION = "API completa para gestión de colas de render de Blender"
-        
-        # Configuración de seguridad
-        self.SECRET_KEY = "your-secret-key-change-in-production"
-        self.ACCESS_TOKEN_EXPIRE_MINUTES = 30
-        
-        # Configuración de archivos
-        self.MAX_UPLOAD_SIZE = 5 * 1024 * 1024 * 1024  # 5GB
-        self.ALLOWED_EXTENSIONS = [".blend"]
-        self.CHUNK_SIZE = 10 * 1024 * 1024  # 10MB
-        
-        # Configuración de render
-        self.DEFAULT_RENDER_ENGINE = self.config["render"]["default_engine"]
-        self.MAX_CONCURRENT_JOBS = self.config["render"]["max_concurrent_jobs"]
-        
-        # Configuración de limpieza automática
-        self.CLEANUP_INTERVAL = 1800  # 30 minutos
-        self.SESSION_TIMEOUT = 3600  # 1 hora
-        self.OLD_JOBS_CLEANUP_DAYS = 7  # Limpiar trabajos de más de 7 días
-    
-    def get_blender_config(self) -> Dict[str, Any]:
-        """Obtener configuración específica de Blender"""
-        return self.config["blender"]
-    
-    def update_blender_config(self, new_config: Dict[str, Any]) -> bool:
-        """Actualizar configuración de Blender"""
-        self.config["blender"].update(new_config)
-        return self.save_config()
-    
-    def get_render_config(self) -> Dict[str, Any]:
-        """Obtener configuración de render"""
-        return self.config["render"]
-    
-    def update_render_config(self, new_config: Dict[str, Any]) -> bool:
-        """Actualizar configuración de render"""
-        self.config["render"].update(new_config)
-        return self.save_config()
-    
-    def save_config(self) -> bool:
-        """Guardar configuración actual"""
-        return save_config(self.config, self.CONFIG_FILE)
-    
-    def reload_config(self) -> bool:
-        """Recargar configuración desde archivo"""
+        self.app_config = self._load_app_config()
+
+    def _load_app_config(self) -> Dict[str, Any]:
+        """Carga la configuración desde config.json y la une con valores por defecto."""
+        default_config = {
+            "blender": {
+                "path": None,
+                "auto_detect": True,
+                "custom_path": None,
+                "version": None,
+                "last_verified": None
+            },
+            "render": {
+                "default_engine": "CYCLES",
+                "max_concurrent_jobs": 3
+            }
+        }
         try:
-            self.config = load_config(self.CONFIG_FILE)
-            return True
+            if self.CONFIG_FILE.exists():
+                with open(self.CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    user_config = json.load(f)
+                    # Unir configuración por defecto con la del usuario
+                    # (esto asegura que no falten claves si el json está incompleto)
+                    for key, value in default_config.items():
+                        if key in user_config and isinstance(value, dict):
+                            value.update(user_config[key])
+                    return default_config
+            return default_config
         except Exception as e:
-            logger.error(f"Error recargando configuración: {e}")
-            return False
-    
-    def reset_config(self) -> bool:
-        """Resetear configuración a valores por defecto"""
-        self.config = DEFAULT_CONFIG.copy()
-        return self.save_config()
-    
-    def get_system_info(self) -> Dict[str, Any]:
-        """Obtener información del sistema"""
-        import platform
-        import sys
-        
-        return {
-            "version": self.API_VERSION,
-            "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
-            "platform": platform.system(),
-            "architecture": platform.machine(),
-            "base_dir": str(self.BASE_DIR),
-            "upload_dir": str(self.UPLOAD_DIR),
-            "output_dir": str(self.OUTPUT_DIR),
-            "temp_dir": str(self.TEMP_DIR)
-        }
-    
-    def validate_config(self) -> Dict[str, Any]:
-        """Validar configuración actual"""
-        issues = []
-        warnings = []
-        
-        # Validar directorios
-        if not self.UPLOAD_DIR.exists():
-            issues.append(f"Directorio de uploads no existe: {self.UPLOAD_DIR}")
-        
-        if not self.OUTPUT_DIR.exists():
-            issues.append(f"Directorio de renders no existe: {self.OUTPUT_DIR}")
-        
-        # Validar configuración de Blender
-        blender_config = self.config["blender"]
-        if not blender_config["path"] and not blender_config["auto_detect"]:
-            issues.append("Blender no está configurado")
-        
-        # Validar configuración de render
-        render_config = self.config["render"]
-        if render_config["max_concurrent_jobs"] < 1:
-            issues.append("max_concurrent_jobs debe ser mayor a 0")
-        
-        if render_config["max_concurrent_jobs"] > 10:
-            warnings.append("max_concurrent_jobs muy alto, puede afectar el rendimiento")
-        
-        return {
-            "valid": len(issues) == 0,
-            "issues": issues,
-            "warnings": warnings
-        }
+            print(f"⚠️ Error cargando config.json: {e}. Usando configuración por defecto.")
+            return default_config
 
-# Instancia singleton de configuración
-settings = Settings()
+    def save_app_config(self):
+        """Guarda la configuración actual en config.json."""
+        try:
+            with open(self.CONFIG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.app_config, f, indent=2, ensure_ascii=False, default=str)
+        except Exception as e:
+            print(f"❌ Error guardando config.json: {e}")
 
-# Función de conveniencia para acceder a la configuración
-def get_settings() -> Settings:
-    """Obtener instancia de configuración"""
-    return settings
+# --- Paso 3: Crear una única instancia global para toda la aplicación ---
+# Primero se cargan las variables de entorno, y luego se pasan a la clase principal.
+env_settings = EnvSettings()
+settings = Settings(env_settings)

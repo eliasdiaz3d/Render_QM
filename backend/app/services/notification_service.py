@@ -10,6 +10,7 @@ from email import encoders
 import asyncio
 import aiohttp
 from pathlib import Path
+from datetime import datetime
 
 from ..core.config import settings
 
@@ -30,8 +31,13 @@ class NotificationService:
     
     async def send_email(self, to_email: str, subject: str, body: str, attachment_path: str = None):
         """Enviar notificación por email"""
+        print("\n--- PASO 4: Dentro del Servicio de Email ---")
+        print(f"👤 Usuario SMTP: {self.email_user}")
+        print(f"🔑 Contraseña SMTP: {'Sí' if self.email_password else 'NO (¡Falta en .env!)'}")
+        print(f"🌍 Servidor SMTP: {self.smtp_server}:{self.smtp_port}")
+        
         if not self.email_user or not self.email_password:
-            print("⚠️ Configuración de email no encontrada")
+            print("⚠️ ERROR: Faltan credenciales de email en el archivo .env")
             return False
         
         try:
@@ -39,8 +45,6 @@ class NotificationService:
             msg['From'] = self.email_user
             msg['To'] = to_email
             msg['Subject'] = subject
-            
-            # Cuerpo del mensaje
             msg.attach(MIMEText(body, 'plain'))
             
             # Agregar adjunto si existe
@@ -56,6 +60,7 @@ class NotificationService:
                     msg.attach(part)
             
             # Enviar email
+            print(f"📬 Intentando conectar y enviar email a {to_email}...")
             server = smtplib.SMTP(self.smtp_server, self.smtp_port)
             server.starttls()
             server.login(self.email_user, self.email_password)
@@ -63,11 +68,11 @@ class NotificationService:
             server.sendmail(self.email_user, to_email, text)
             server.quit()
             
-            print(f"📧 Email enviado a {to_email}")
+            print(f"✔️ Email enviado exitosamente a {to_email}")
             return True
             
         except Exception as e:
-            print(f"❌ Error enviando email: {e}")
+            print(f"❌ ERROR CRÍTICO AL ENVIAR EMAIL: {e}")
             return False
     
     async def send_whatsapp(self, to_number: str, message: str):
