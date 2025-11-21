@@ -167,9 +167,9 @@ class RenderSettings(BaseModel):
     resolution_y: int = Field(1080, ge=1, le=8192)
     resolution_percentage: int = Field(100, ge=1, le=100)
     frame_rate: float = Field(24.0, ge=1.0, le=120.0)
-    output_format: str = Field("PNG", regex="^(PNG|JPEG|EXR|TIFF|BMP)$")
-    color_mode: str = Field("RGBA", regex="^(BW|RGB|RGBA)$")
-    color_depth: str = Field("8", regex="^(8|16|32)$")
+    output_format: str = Field("PNG", pattern="^(PNG|JPEG|EXR|TIFF|BMP)$")
+    color_mode: str = Field("RGBA", pattern="^(BW|RGB|RGBA)$")
+    color_depth: str = Field("8", pattern="^(8|16|32)$")
     compression: int = Field(15, ge=0, le=100)
     quality: int = Field(90, ge=0, le=100)
     
@@ -195,8 +195,8 @@ class JobSearch(BaseModel):
     """Parámetros de búsqueda de trabajos"""
     query: Optional[str] = Field(None, max_length=100, description="Búsqueda por texto")
     filters: Optional[JobFilter] = None
-    sort_by: str = Field("created_at", regex="^(created_at|name|status|priority|progress|frames_total)$")
-    sort_order: str = Field("desc", regex="^(asc|desc)$")
+    sort_by: str = Field("created_at", pattern="^(created_at|name|status|priority|progress|frames_total)$")
+    sort_order: str = Field("desc", pattern="^(asc|desc)$")
     page: int = Field(1, ge=1)
     page_size: int = Field(20, ge=1, le=100)
 
@@ -258,21 +258,21 @@ class JobNotification(BaseModel):
     timestamp: datetime = Field(default_factory=datetime.now)
     channels: List[str] = Field(default_factory=list)  # ["email", "whatsapp", "slack"]
     attachments: List[str] = Field(default_factory=list)
-    priority: str = Field("normal", regex="^(low|normal|high|urgent)$")
+    priority: str = Field("normal", pattern="^(low|normal|high|urgent)$")
 
 # ==================== MODELOS DE EXPORTS ====================
 
 class JobExport(BaseModel):
     """Configuración para exportar trabajos"""
     job_ids: List[str] = Field(..., min_items=1)
-    export_format: str = Field("json", regex="^(json|csv|excel)$")
+    export_format: str = Field("json", pattern="^(json|csv|excel)$")
     include_files: bool = False
     include_previews: bool = False
     compression: bool = True
 
 class JobImport(BaseModel):
     """Configuración para importar trabajos"""
-    import_format: str = Field("json", regex="^(json|csv)$")
+    import_format: str = Field("json", pattern="^(json|csv)$")
     overwrite_existing: bool = False
     validate_files: bool = True
     auto_start: bool = False

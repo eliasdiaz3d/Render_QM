@@ -5,7 +5,10 @@ import os
 import re
 import json
 import logging
+import shutil
+import string
 from typing import List, Dict, Optional
+from datetime import datetime
 from pathlib import Path
 
 from app.core.config import settings
@@ -20,66 +23,107 @@ class BlenderService:
         self._blender_cache = {}  # Cache para paths verificados
     
     def scan_for_blender(self) -> List[Dict]:
-        """Escanear sistema buscando instalaciones de Blender"""
-        logger.info("🔍 Escaneando instalaciones de Blender...")
+        """
+        Escanear sistema buscando instalaciones de Blender.
+        Busca en PATH, Registro de Windows y carpetas comunes en TODOS los discos.
+        """
+        logger.info("🔍 Escaneando instalaciones de Blender (Escaneo profundo)...")
         
         found_installations = []
         system = platform.system()
-        possible_paths = []
+        possible_paths = set()  # Usamos set para evitar duplicados
+        
+        # 1. Buscar en el PATH del sistema (si escribes 'blender' en terminal)
+        in_path = shutil.which("blender")
+        if in_path:
+            possible_paths.add(in_path)
         
         if system == "Windows":
-            base_paths = [
-                r"C:\Program Files\Blender Foundation",
-                r"C:\Program Files (x86)\Blender Foundation",
-                r"C:\Blender",
-                os.path.expanduser(r"~\AppData\Local\Programs\Blender Foundation"),
-                os.path.expanduser(r"~\Desktop")
-            ]
-            
-            for base_path in base_paths:
-                if os.path.exists(base_path):
+            # --- ESTRATEGIA A: REGISTRO DE WINDOWS (La más precisa) ---
+            try:
+                import winreg
+                key_paths = [r"SOFTWARE\BlenderFoundation", r"SOFTWARE\WOW6432Node\BlenderFoundation"]
+                
+                for key_path in key_paths:
                     try:
-                        for item in os.listdir(base_path):
-                            if "blender" in item.lower():
-                                blender_exe = os.path.join(base_path, item, "blender.exe")
-                                if os.path.exists(blender_exe):
-                                    possible_paths.append(blender_exe)
-                    except PermissionError:
-                        logger.warning(f"⚠️ Sin permisos para acceder a: {base_path}")
+                        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as key:
+                            i = 0
+                            while True:
+                                try:
+                                    # Leer versiones instaladas (ej: Blender 4.0)
+                                    v_name = winreg.EnumKey(key, i)
+                                    sub_key_path = f"{key_path}\\{v_name}"
+                                    
+                                    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, sub_key_path) as subkey:
+                                        install_path, _ = winreg.QueryValueEx(subkey, "InstallDir")
+                                        if install_path:
+                                            exe_path = os.path.join(install_path, "blender.exe")
+                                            if os.path.exists(exe_path):
+                                                possible_paths.add(exe_path)
+                                    i += 1
+                                except OSError:
+                                    break
+                    except FileNotFoundError:
                         continue
+            except Exception as e:
+                logger.warning(f"⚠️ No se pudo leer el registro de Windows completamente: {e}")
+
+            # --- ESTRATEGIA B: BÚSQUEDA EN TODOS LOS DISCOS (C:, D:, E:...) ---
+            # Detectar letras de unidad disponibles
+            drives = ['%s:\\' % d for d in string.ascii_uppercase if os.path.exists('%s:\\' % d)]
             
-            # Rutas específicas adicionales
-            specific_paths = [
-                r"C:\Program Files\Blender Foundation\Blender 4.4\blender.exe",
-                r"C:\Program Files\Blender Foundation\Blender 4.0\blender.exe",
-                r"C:\Program Files\Blender Foundation\Blender 3.6\blender.exe",
-                r"C:\Program Files\Blender Foundation\Blender 3.5\blender.exe",
-                r"C:\Program Files\Blender Foundation\Blender 3.4\blender.exe",
-                r"C:\Program Files (x86)\Blender Foundation\Blender 4.4\blender.exe",
-                r"C:\Program Files (x86)\Blender Foundation\Blender 4.0\blender.exe",
-                r"C:\Program Files (x86)\Blender Foundation\Blender 3.6\blender.exe"
+            common_subfolders = [
+                "Program Files\\Blender Foundation",
+                "Program Files (x86)\\Blender Foundation",
+                "Blender Foundation",
+                "Software\\Blender Foundation",
+                "Blender",
+                "Programs\\Blender",
+                "Tools\\Blender" # Común en setups portables
             ]
-            possible_paths.extend(specific_paths)
+
+            for drive in drives:
+                for subfolder in common_subfolders:
+                    search_path = os.path.join(drive, subfolder)
+                    if os.path.exists(search_path):
+                        try:
+                            # Buscar carpetas de versión (ej: "Blender 4.0") o ejecutable directo
+                            for item in os.listdir(search_path):
+                                full_path = os.path.join(search_path, item)
+                                
+                                # Caso 1: Es una carpeta de versión (ej: "Blender 4.2")
+                                if os.path.isdir(full_path):
+                                    blender_exe = os.path.join(full_path, "blender.exe")
+                                    if os.path.exists(blender_exe):
+                                        possible_paths.add(blender_exe)
+                                
+                                # Caso 2: Es el ejecutable directamente (ej: .../Blender/blender.exe)
+                                elif item.lower() == "blender.exe":
+                                    possible_paths.add(full_path)
+                                    
+                        except PermissionError:
+                            continue
             
         elif system == "Darwin":  # macOS
-            possible_paths = [
+            possible_paths.update([
                 "/Applications/Blender.app/Contents/MacOS/Blender",
                 "/usr/local/bin/blender",
                 os.path.expanduser("~/Applications/Blender.app/Contents/MacOS/Blender")
-            ]
+            ])
         elif system == "Linux":
-            possible_paths = [
+            possible_paths.update([
                 "/usr/bin/blender",
                 "/usr/local/bin/blender", 
                 "/opt/blender/blender",
                 "/snap/bin/blender",
                 os.path.expanduser("~/blender/blender")
-            ]
+            ])
         
-        # Verificar cada path
-        for path in set(possible_paths):  # set para eliminar duplicados
+        # Verificar cada path encontrado
+        for path in possible_paths:
             if os.path.exists(path):
                 verification = self._verify_blender_installation(path)
+                # Solo añadir si es válido o si queremos mostrar el error
                 found_installations.append({
                     "path": path,
                     "version": verification.get("version", "Desconocida"),
@@ -89,6 +133,9 @@ class BlenderService:
                     "error": verification.get("error"),
                     "render_capable": verification.get("render_capable", False)
                 })
+        
+        # Ordenar resultados: Versiones más nuevas primero
+        found_installations.sort(key=lambda x: x.get("version", "0"), reverse=True)
         
         logger.info(f"✅ Encontradas {len(found_installations)} instalaciones de Blender")
         return found_installations
@@ -607,37 +654,69 @@ except Exception as e:
         
         return recommendations
     
-    def auto_detect_and_configure(self) -> bool:
+    def auto_detect_and_configure(self) -> Dict:
         """Auto-detectar y configurar Blender automáticamente"""
         logger.info("🔄 Auto-detectando y configurando Blender...")
         
+        # 1. Escanear
         installations = self.scan_for_blender()
-        working_installations = [inst for inst in installations if inst["valid"]]
+        
+        # 2. Filtrar solo las que funcionan
+        working_installations = [inst for inst in installations if inst.get("valid") or inst.get("working")]
         
         if not working_installations:
             logger.error("❌ No se encontraron instalaciones válidas de Blender")
-            return False
+            return {"success": False, "message": "No se encontró ninguna instalación válida de Blender"}
         
-        # Seleccionar la mejor instalación (más reciente)
-        best_installation = max(working_installations, key=lambda x: x.get("version", "0"))
+        # 3. Seleccionar la mejor (la versión más alta)
+        def version_key(inst):
+            v = inst.get("version", "0")
+            try:
+                # Extraer solo números (ej: "4.5.4" -> (4, 5, 4))
+                return tuple(map(int, re.findall(r'\d+', v)))
+            except:
+                return (0,0,0)
+
+        best_installation = max(working_installations, key=version_key)
+        path = best_installation["path"]
+        version = best_installation.get("version", "Desconocida")
         
-        # Actualizar configuración
-        blender_config = self.settings.get_blender_config()
-        blender_config.update({
-            "path": best_installation["path"],
-            "version": best_installation["version"],
-            "auto_detect": True,
-            "last_verified": datetime.now().isoformat()
-        })
-        
-        success = self.settings.update_blender_config(blender_config)
-        
-        if success:
-            logger.info(f"✅ Blender configurado: {best_installation['path']} (v{best_installation['version']})")
-        else:
-            logger.error("❌ Error guardando configuración de Blender")
-        
-        return success
+        logger.info(f"✅ Mejor versión seleccionada: {path} (v{version})")
+
+        # 4. Guardar en la configuración
+        try:
+            current_config = self.settings.get_blender_config()
+            
+            # Actualizamos variables en memoria y .env
+            current_config.update({
+                "path": path,
+                "version": version,
+                "auto_detect": True,
+                "last_verified": datetime.now().isoformat()
+            })
+            
+            self.settings.update_blender_config(current_config)
+            
+            # 5. RESPUESTA UNIVERSAL (Aquí estaba el problema)
+            # Enviamos TODOS los formatos posibles para que el frontend no falle
+            return {
+                "success": True,
+                "message": f"Blender {version} detectado correctamente",
+                
+                # Variantes de datos para compatibilidad con el Frontend
+                "path": path,
+                "blender_path": path,        # <--- Esta es la que probablemente espera Vue.js
+                "executable": path,
+                "version": version,
+                "blender_version": version,
+                
+                "detected": True,
+                "auto_detected": True
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Error guardando configuración: {e}")
+            return {"success": False, "message": f"Error guardando configuración: {str(e)}"}
     
     def test_render_capability(self, blender_path: str) -> Dict:
         """Probar capacidades de render de una instalación de Blender"""

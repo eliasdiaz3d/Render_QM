@@ -259,8 +259,8 @@ class NodeSearch(BaseModel):
     """Parámetros de búsqueda de nodos"""
     query: Optional[str] = Field(None, max_length=100)
     filters: Optional[NodeFilter] = None
-    sort_by: str = Field("last_seen", regex="^(node_name|status|last_seen|efficiency_score|total_jobs_completed)$")
-    sort_order: str = Field("desc", regex="^(asc|desc)$")
+    sort_by: str = Field("last_seen", pattern="^(node_name|status|last_seen|efficiency_score|total_jobs_completed)$")
+    sort_order: str = Field("desc", pattern="^(asc|desc)$")
     include_offline: bool = False
 
 # ==================== MODELOS DE MANTENIMIENTO ====================
@@ -268,7 +268,7 @@ class NodeSearch(BaseModel):
 class NodeMaintenance(BaseModel):
     """Programar mantenimiento de nodo"""
     node_id: str
-    maintenance_type: str = Field(regex="^(update|restart|cleanup|diagnostic)$")
+    maintenance_type: str = Field(pattern="^(update|restart|cleanup|diagnostic)$")
     scheduled_at: datetime
     estimated_duration_minutes: int = Field(30, ge=1, le=1440)  # máximo 24 horas
     description: Optional[str] = None
@@ -279,7 +279,7 @@ class NodeDiagnostic(BaseModel):
     """Diagnóstico de nodo"""
     node_id: str
     timestamp: datetime
-    overall_health: str = Field(regex="^(healthy|warning|critical|unknown)$")
+    overall_health: str = Field(pattern="^(healthy|warning|critical|unknown)$")
     checks: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     recommendations: List[str] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)

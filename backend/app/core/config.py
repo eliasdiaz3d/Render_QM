@@ -1,90 +1,111 @@
-# D:\Render_QM\Render_QM\backend\app\core\config.py
+# app/core/config.py
 
-import json
-from pathlib import Path
-from typing import Any, Dict
+import os
+from typing import List, Union, Dict, Any
+from pydantic import AnyHttpUrl, field_validator
 from pydantic_settings import BaseSettings
 
-# --- Paso 1: Clase para cargar secretos desde el archivo .env ---
-# Esta clase se encarga de las contraseñas, tokens y claves de API.
-class EnvSettings(BaseSettings):
-    # Variables para Email (leídas desde .env)
-    SMTP_SERVER: str = "smtp.gmail.com"
-    SMTP_PORT: int = 587
-    SMTP_USER: str | None = None
-    SMTP_PASSWORD: str | None = None
+class Settings(BaseSettings):
+    PROJECT_NAME: str = "Render Queue Manager"
+    API_V1_STR: str = "/api/v1"
     
-    # Variables para Twilio (leídas desde .env)
-    TWILIO_ACCOUNT_SID: str | None = None
-    TWILIO_AUTH_TOKEN: str | None = None
-    TWILIO_WHATSAPP_FROM: str | None = None
+    # CORS
+    BACKEND_CORS_ORIGINS: List[AnyHttpUrl] = []
+
+    @field_validator("BACKEND_CORS_ORIGINS", mode="before")
+    def assemble_cors_origins(cls, v: Union[str, List[str]]) -> Union[List[str], str]:
+        if isinstance(v, str) and not v.startswith("["):
+            return [i.strip() for i in v.split(",")]
+        elif isinstance(v, (list, str)):
+            return v
+        raise ValueError(v)
+
+    # Base de datos
+    DATABASE_URL: str = "sqlite:///./render_queue.db"
     
-    # Variables para Telegram (leídas desde .env)
-    TELEGRAM_BOT_TOKEN: str | None = None
+    # Seguridad
+    SECRET_KEY: str = "development_secret_key_change_in_production"
+    ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    
+    # Configuración de Blender (Valores por defecto)
+    BLENDER_PATH: str = ""
+    BLENDER_VERSION: str = ""
+    BLENDER_AUTO_DETECT: bool = False
+    BLENDER_LAST_VERIFIED: str = ""
 
     class Config:
-        # Le decimos a Pydantic que lea el archivo .env desde la carpeta raíz del backend
-        env_file = Path(__file__).parent.parent.parent / ".env"
-        env_file_encoding = 'utf-8'
+        case_sensitive = True
+        env_file = ".env"
+        extra = "ignore" # Ignorar variables extra en el .env
 
-# --- Paso 2: Clase principal de configuración que combina todo ---
-class Settings:
-    def __init__(self, env_settings: EnvSettings):
-        # Cargar las credenciales desde la clase de entorno
-        self.smtp_server = env_settings.SMTP_SERVER
-        self.smtp_port = env_settings.SMTP_PORT
-        self.smtp_user = env_settings.SMTP_USER
-        self.smtp_password = env_settings.SMTP_PASSWORD
-        self.twilio_account_sid = env_settings.TWILIO_ACCOUNT_SID
-        self.twilio_auth_token = env_settings.TWILIO_AUTH_TOKEN
-        self.twilio_whatsapp_from = env_settings.TWILIO_WHATSAPP_FROM
-        self.telegram_bot_token = env_settings.TELEGRAM_BOT_TOKEN
+    # --- NUEVAS FUNCIONES PARA GESTIONAR LA CONFIGURACIÓN ---
 
-        # Cargar la configuración de la aplicación desde config.json
-        self.BASE_DIR = Path(__file__).parent.parent.parent
-        self.CONFIG_FILE = self.BASE_DIR / "config.json"
-        
-        self.app_config = self._load_app_config()
-
-    def _load_app_config(self) -> Dict[str, Any]:
-        """Carga la configuración desde config.json y la une con valores por defecto."""
-        default_config = {
-            "blender": {
-                "path": None,
-                "auto_detect": True,
-                "custom_path": None,
-                "version": None,
-                "last_verified": None
-            },
-            "render": {
-                "default_engine": "CYCLES",
-                "max_concurrent_jobs": 3
-            }
+    def get_blender_config(self) -> Dict[str, Any]:
+        """Devuelve la configuración actual de Blender en formato diccionario"""
+        return {
+            "path": self.BLENDER_PATH,
+            "version": self.BLENDER_VERSION,
+            "auto_detect": self.BLENDER_AUTO_DETECT,
+            "last_verified": self.BLENDER_LAST_VERIFIED,
+            "custom_path": self.BLENDER_PATH # Alias para compatibilidad
         }
-        try:
-            if self.CONFIG_FILE.exists():
-                with open(self.CONFIG_FILE, 'r', encoding='utf-8') as f:
-                    user_config = json.load(f)
-                    # Unir configuración por defecto con la del usuario
-                    # (esto asegura que no falten claves si el json está incompleto)
-                    for key, value in default_config.items():
-                        if key in user_config and isinstance(value, dict):
-                            value.update(user_config[key])
-                    return default_config
-            return default_config
-        except Exception as e:
-            print(f"⚠️ Error cargando config.json: {e}. Usando configuración por defecto.")
-            return default_config
 
-    def save_app_config(self):
-        """Guarda la configuración actual en config.json."""
+    def update_blender_config(self, config: Dict[str, Any]) -> bool:
+        """
+        Actualiza la configuración en memoria y la guarda en el archivo .env
+        para que persista después de reiniciar.
+        """
         try:
-            with open(self.CONFIG_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self.app_config, f, indent=2, ensure_ascii=False, default=str)
-        except Exception as e:
-            print(f"❌ Error guardando config.json: {e}")
+            # 1. Actualizar variables en memoria (Runtime)
+            if "path" in config:
+                self.BLENDER_PATH = config["path"]
+            if "version" in config:
+                self.BLENDER_VERSION = config["version"]
+            if "auto_detect" in config:
+                self.BLENDER_AUTO_DETECT = bool(config["auto_detect"])
+            if "last_verified" in config:
+                self.BLENDER_LAST_VERIFIED = config["last_verified"]
 
-# --- Paso 3: Crear una única instancia global para toda la aplicación ---
-# Primero se cargan las variables de entorno, y luego se pasan a la clase principal.
-env_settings = EnvSettings()
-settings = Settings(env_settings)
+            # 2. Guardar en archivo .env (Persistencia)
+            self._update_env_file({
+                "BLENDER_PATH": self.BLENDER_PATH,
+                "BLENDER_VERSION": self.BLENDER_VERSION,
+                "BLENDER_AUTO_DETECT": str(self.BLENDER_AUTO_DETECT),
+                "BLENDER_LAST_VERIFIED": self.BLENDER_LAST_VERIFIED
+            })
+            return True
+        except Exception as e:
+            print(f"Error guardando configuración: {e}")
+            return False
+
+    def _update_env_file(self, updates: Dict[str, str]):
+        """Escribe los cambios en el archivo .env sin borrar lo demás"""
+        env_path = ".env"
+        
+        # Leer contenido actual
+        lines = []
+        if os.path.exists(env_path):
+            with open(env_path, "r") as f:
+                lines = f.readlines()
+
+        # Crear mapa de claves existentes
+        keys_map = {}
+        for i, line in enumerate(lines):
+            if "=" in line and not line.strip().startswith("#"):
+                key = line.split("=")[0].strip()
+                keys_map[key] = i
+
+        # Actualizar o agregar líneas
+        for key, value in updates.items():
+            new_line = f"{key}={value}\n"
+            if key in keys_map:
+                lines[keys_map[key]] = new_line
+            else:
+                lines.append(new_line)
+
+        # Escribir archivo
+        with open(env_path, "w") as f:
+            f.writelines(lines)
+
+settings = Settings()
