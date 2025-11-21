@@ -9,6 +9,7 @@ import os
 import shutil
 from datetime import datetime
 from pathlib import Path
+import asyncio
 
 from app.models.job import (
     JobCreate, JobUpdate, JobResponse, JobListResponse, 
@@ -78,7 +79,7 @@ async def upload_and_create_job(
         job = get_job(job_id)
         
         # Iniciar render en background
-        background_tasks.add_task(render_service.render_job_background, job_id)
+        asyncio.create_task(render_service.render_job_background(job_id))  
         
         return {
             "message": "Archivo subido y trabajo creado exitosamente",

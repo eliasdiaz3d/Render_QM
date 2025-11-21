@@ -1,4 +1,4 @@
-# node_agent.py - Agente principal del nodo de render
+# node_agent.py - Versión Definitiva Corregida
 import asyncio
 import aiohttp
 import psutil
@@ -16,6 +16,12 @@ import hashlib
 import shutil
 from dataclasses import dataclass, asdict
 import yaml
+import signal
+import sys
+
+# IMPORTANTE: Configuración específica para Windows
+if platform.system() == 'Windows':
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 # Configurar logging
 logging.basicConfig(
@@ -31,8 +37,8 @@ class NodeConfig:
     master_url: str = "http://localhost:8000"
     node_port: int = 8001
     max_concurrent_jobs: int = 1
-    temp_dir: str = "./temp"
-    output_dir: str = "./renders"
+    temp_dir: str = "./temp_node"
+    output_dir: str = "./renders_node"
     blender_path: str = ""
     heartbeat_interval: int = 10
     auto_start: bool = True
@@ -41,6 +47,8 @@ class NodeConfig:
     max_memory_gb: int = 8
     priority_weight: float = 1.0
     tags: list = None
+    connection_timeout: int = 30
+    request_timeout: int = 60
 
     def __post_init__(self):
         if self.tags is None:
@@ -90,11 +98,11 @@ class SystemMonitor:
         """Obtener estadísticas actuales del sistema"""
         try:
             # CPU y Memoria
-            cpu_percent = psutil.cpu_percent(interval=1)
+            cpu_percent = psutil.cpu_percent(interval=0.1)  # Reducir interval
             memory = psutil.virtual_memory()
             disk = psutil.disk_usage('.')
             
-            # GPU (si está disponible)
+            # GPU (opcional)
             gpu_count = 0
             gpu_memory_total = 0
             gpu_memory_used = 0
@@ -107,23 +115,16 @@ class SystemMonitor:
                     gpu_memory_total = sum(gpu.memoryTotal for gpu in gpus)
                     gpu_memory_used = sum(gpu.memoryUsed for gpu in gpus)
             except ImportError:
-                logger.warning("GPUtil no disponible - monitoreo GPU deshabilitado")
+                pass
             
             # Temperatura (si está disponible)
             temperature = {}
             try:
                 temps = psutil.sensors_temperatures()
-                for name, entries in temps.items():
-                    if entries:
-                        temperature[name] = entries[0].current
-            except:
-                pass
-            
-            # Load average (Unix/Linux)
-            load_avg = 0.0
-            try:
-                if hasattr(os, 'getloadavg'):
-                    load_avg = os.getloadavg()[0]
+                if temps:
+                    for name, entries in temps.items():
+                        if entries:
+                            temperature[name] = entries[0].current
             except:
                 pass
             
@@ -138,95 +139,161 @@ class SystemMonitor:
                 gpu_memory_total=gpu_memory_total,
                 gpu_memory_used=gpu_memory_used,
                 temperature=temperature,
-                load_average=load_avg
+                load_average=cpu_percent / 100.0
             )
+            
         except Exception as e:
             logger.error(f"Error obteniendo estadísticas del sistema: {e}")
             return SystemStats(
-                cpu_percent=0, memory_percent=0, memory_available_gb=0,
-                memory_total_gb=0, disk_free_gb=0, disk_total_gb=0, gpu_count=0
+                cpu_percent=0.0,
+                memory_percent=0.0,
+                memory_available_gb=0.0,
+                memory_total_gb=0.0,
+                disk_free_gb=0.0,
+                disk_total_gb=0.0,
+                gpu_count=0
             )
 
-    @staticmethod
-    def get_node_info() -> Dict[str, Any]:
-        """Obtener información estática del nodo"""
-        return {
-            "hostname": platform.node(),
-            "platform": platform.system(),
-            "platform_version": platform.release(),
-            "architecture": platform.machine(),
-            "processor": platform.processor(),
-            "cpu_cores_physical": psutil.cpu_count(logical=False),
-            "cpu_cores_logical": psutil.cpu_count(logical=True),
-            "python_version": platform.python_version(),
-            "node_agent_version": "1.0.0"
-        }
-
 class FileTransferManager:
-    """Gestor de transferencia de archivos"""
+    """Gestor de transferencia de archivos con el master - VERSIÓN DEFINITIVA"""
     
     def __init__(self, temp_dir: str, master_url: str):
-        self.temp_dir = Path(temp_dir)
+        self.temp_dir = Path(temp_dir).resolve()  # RESOLVER RUTA ABSOLUTA
         self.master_url = master_url
         self.temp_dir.mkdir(exist_ok=True)
-        
-    async def download_job_files(self, job_id: str, job_data: Dict) -> str:
-        """Descargar archivos necesarios para el trabajo"""
+        logger.info(f"FileTransferManager inicializado en: {self.temp_dir}")
+    
+    async def download_job_files(self, job_id: str, timeout: int = 300) -> Optional[str]:
+        """Descargar archivos del trabajo - SOLUCIÓN DEFINITIVA"""
         try:
-            logger.info(f"Descargando archivos para trabajo {job_id}")
-            
-            # Crear directorio específico para este trabajo
+            # CREAR DIRECTORIO ÚNICO PARA EL TRABAJO
             job_dir = self.temp_dir / job_id
-            job_dir.mkdir(exist_ok=True)
+            if job_dir.exists():
+                shutil.rmtree(job_dir)  # Limpiar si existe
+            job_dir.mkdir(parents=True, exist_ok=True)
             
-            # Descargar archivo .blend principal
-            blend_url = f"{self.master_url}/api/v1/jobs/{job_id}/download-blend"
-            blend_path = job_dir / f"{job_id}.blend"
+            download_url = f"{self.master_url}/api/v1/jobs/{job_id}/download"
+            logger.info(f"Descargando archivos desde: {download_url}")
+            logger.info(f"Directorio de destino: {job_dir}")
             
-            async with aiohttp.ClientSession() as session:
-                async with session.get(blend_url) as response:
-                    if response.status == 200:
-                        with open(blend_path, 'wb') as f:
-                            async for chunk in response.content.iter_chunked(8192):
-                                f.write(chunk)
-                        logger.info(f"Archivo .blend descargado: {blend_path}")
-                    else:
-                        raise Exception(f"Error descargando .blend: HTTP {response.status}")
+            # Configurar timeout robusto
+            connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300, use_dns_cache=True)
+            timeout_config = aiohttp.ClientTimeout(
+                total=timeout,
+                connect=30,
+                sock_read=60,
+                sock_connect=30
+            )
             
-            # TODO: Descargar assets adicionales si es necesario
-            # - Texturas
-            # - Cachés
-            # - Referencias externas
-            
-            return str(blend_path)
-            
+            async with aiohttp.ClientSession(
+                connector=connector, 
+                timeout=timeout_config
+            ) as session:
+                try:
+                    async with session.get(download_url) as response:
+                        if response.status == 200:
+                            content = await response.read()
+                            
+                            # Guardar archivo ZIP
+                            zip_path = job_dir / f"{job_id}.zip"
+                            with open(zip_path, 'wb') as f:
+                                f.write(content)
+                            logger.info(f"ZIP descargado: {zip_path} ({len(content)} bytes)")
+                            
+                            # Extraer archivos DIRECTAMENTE al job_dir
+                            import zipfile
+                            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                                extracted_files = zip_ref.namelist()
+                                zip_ref.extractall(job_dir)
+                                logger.info(f"Archivos extraídos: {extracted_files}")
+                            
+                            # BUSCAR ARCHIVO .BLEND - SOLUCIÓN DEFINITIVA
+                            blend_files = []
+                            
+                            # Buscar archivos .blend directamente en job_dir
+                            for file_path in job_dir.iterdir():
+                                if file_path.is_file() and file_path.suffix.lower() == '.blend':
+                                    blend_files.append(file_path)
+                            
+                            # Si no hay archivos en el directorio principal, buscar recursivamente
+                            if not blend_files:
+                                blend_files = list(job_dir.rglob("*.blend"))
+                            
+                            if blend_files:
+                                # USAR RUTA ABSOLUTA RESUELTA
+                                blend_file = blend_files[0].resolve()
+                                logger.info(f"Archivo .blend encontrado: {blend_file}")
+                                
+                                # VERIFICAR QUE EL ARCHIVO EXISTE
+                                if blend_file.exists():
+                                    logger.info(f"Archivos descargados exitosamente para {job_id}")
+                                    return str(blend_file)
+                                else:
+                                    logger.error(f"El archivo .blend no existe después de la extracción: {blend_file}")
+                                    return None
+                            else:
+                                logger.error(f"No se encontró archivo .blend para {job_id}")
+                                # DEBUG: Listar todos los archivos
+                                all_files = list(job_dir.rglob("*"))
+                                logger.info(f"Todos los archivos en {job_dir}:")
+                                for f in all_files:
+                                    logger.info(f"  - {f}")
+                                return None
+                        else:
+                            logger.error(f"Error descargando {job_id}: HTTP {response.status}")
+                            return None
+                            
+                except asyncio.TimeoutError:
+                    logger.error(f"Timeout descargando archivos para {job_id}")
+                    return None
+                except Exception as e:
+                    logger.error(f"Error en descarga de {job_id}: {e}")
+                    return None
+                    
         except Exception as e:
             logger.error(f"Error descargando archivos para {job_id}: {e}")
-            raise
+            return None
     
-    async def upload_results(self, job_id: str, output_files: list) -> bool:
+    async def upload_results(self, job_id: str, output_files: list, timeout: int = 300) -> bool:
         """Subir resultados del render al master"""
         try:
             logger.info(f"Subiendo resultados para trabajo {job_id}")
             
-            async with aiohttp.ClientSession() as session:
+            connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300, use_dns_cache=True)
+            timeout_config = aiohttp.ClientTimeout(
+                total=timeout,
+                connect=30,
+                sock_read=120,
+                sock_connect=30
+            )
+            
+            async with aiohttp.ClientSession(
+                connector=connector,
+                timeout=timeout_config
+            ) as session:
                 for file_path in output_files:
                     if not os.path.exists(file_path):
+                        logger.warning(f"Archivo no existe: {file_path}")
                         continue
                         
                     file_name = os.path.basename(file_path)
                     upload_url = f"{self.master_url}/api/v1/jobs/{job_id}/upload-result"
                     
-                    with open(file_path, 'rb') as f:
-                        data = aiohttp.FormData()
-                        data.add_field('file', f, filename=file_name)
-                        
-                        async with session.post(upload_url, data=data) as response:
-                            if response.status == 200:
-                                logger.info(f"Archivo subido: {file_name}")
-                            else:
-                                logger.error(f"Error subiendo {file_name}: HTTP {response.status}")
-                                return False
+                    try:
+                        with open(file_path, 'rb') as f:
+                            data = aiohttp.FormData()
+                            data.add_field('file', f, filename=file_name)
+                            
+                            async with session.post(upload_url, data=data) as response:
+                                if response.status == 200:
+                                    logger.info(f"Archivo subido: {file_name}")
+                                else:
+                                    logger.error(f"Error subiendo {file_name}: HTTP {response.status}")
+                                    return False
+                                    
+                    except Exception as e:
+                        logger.error(f"Error subiendo {file_name}: {e}")
+                        return False
             
             return True
             
@@ -245,135 +312,158 @@ class FileTransferManager:
             logger.error(f"Error limpiando archivos para {job_id}: {e}")
 
 class RenderExecutor:
-    """Ejecutor de renders usando Blender"""
+    """Ejecutor de renders usando Blender - VERSIÓN DEFINITIVA"""
     
     def __init__(self, config: NodeConfig):
         self.config = config
         self.current_process = None
         
+    def create_gpu_script(self, job_dir: Path) -> str:
+        """Crear script de configuración GPU para Blender"""
+        gpu_script = job_dir / "gpu_setup.py"
+        
+        script_content = '''
+import bpy
+
+# Configurar motor de render
+scene = bpy.context.scene
+scene.render.engine = 'CYCLES'
+
+try:
+    # Configurar dispositivo de render
+    if hasattr(bpy.context.preferences.addons.get("cycles"), "preferences"):
+        cycles_prefs = bpy.context.preferences.addons["cycles"].preferences
+        cycles_prefs.compute_device_type = 'CUDA'  # o 'OPENCL' según GPU
+        
+        # Habilitar todos los dispositivos GPU disponibles
+        for device in cycles_prefs.devices:
+            if device.type in {'CUDA', 'OPENCL'}:
+                device.use = True
+
+    # Configurar scene para usar GPU
+    scene.cycles.device = 'GPU'
+    print("✓ GPU configurado correctamente")
+except Exception as e:
+    print(f"⚠ No se pudo configurar GPU: {e}")
+    print("→ Usando CPU como fallback")
+    scene.cycles.device = 'CPU'
+'''
+        
+        with open(gpu_script, 'w', encoding='utf-8') as f:
+            f.write(script_content)
+            
+        return str(gpu_script)
+    
     async def execute_render(self, job_id: str, blend_file: str, job_data: Dict, 
                            progress_callback=None) -> tuple[bool, list]:
-        """Ejecutar render de un trabajo"""
-        output_files = []
-        
+        """Ejecutar render - SOLUCIÓN DEFINITIVA PARA RUTAS"""
         try:
             logger.info(f"Iniciando render del trabajo {job_id}")
             
-            # Configurar parámetros de render
-            frame_start = job_data.get("frame_start", 1)
-            frame_end = job_data.get("frame_end", 1) 
-            render_engine = job_data.get("render_engine", "CYCLES")
+            # CONVERTIR A PATH Y RESOLVER ABSOLUTAMENTE
+            blend_path = Path(blend_file).resolve()
+            job_dir = blend_path.parent
+            output_dir = job_dir / "output"
+            output_dir.mkdir(exist_ok=True)
             
-            # Directorio de salida
-            output_dir = Path(self.config.output_dir) / job_id
-            output_dir.mkdir(parents=True, exist_ok=True)
+            # VERIFICAR EXISTENCIA DEL ARCHIVO
+            if not blend_path.exists():
+                logger.error(f"Archivo .blend no existe: {blend_path}")
+                return False, []
             
-            # Patrón de archivo de salida
-            output_pattern = str(output_dir / "frame_####")
+            logger.info(f"Archivo .blend verificado: {blend_path}")
+            logger.info(f"Directorio de trabajo: {job_dir}")
+            logger.info(f"Directorio de salida: {output_dir}")
             
-            # Construir comando de Blender
+            # Parámetros del render
+            start_frame = job_data.get('start_frame', 1)
+            end_frame = job_data.get('end_frame', 1)
+            output_format = job_data.get('output_format', 'PNG')
+            
+            # Crear script GPU si está habilitado
+            gpu_script = None
+            if self.config.gpu_enabled:
+                gpu_script = self.create_gpu_script(job_dir)
+            
+            # CONSTRUIR COMANDO CON RUTAS ABSOLUTAS - SOLUCIÓN DEFINITIVA
             cmd = [
                 self.config.blender_path,
                 "-b",  # Background mode
-                blend_file,
-                "-o", output_pattern,
-                "-s", str(frame_start),
-                "-e", str(frame_end),
-                "-a"  # Render animation
+                str(blend_path),  # RUTA ABSOLUTA RESUELTA
+                "-o", str(output_dir / "frame_####"),  # RUTA ABSOLUTA DE SALIDA
+                "-s", str(start_frame),
+                "-e", str(end_frame),
+                "-a"  # Animate (render all frames)
             ]
             
-            # Añadir configuraciones específicas
-            if render_engine == "CYCLES":
-                if self.config.gpu_enabled:
-                    cmd.extend(["-P", self._create_gpu_script()])
+            if gpu_script:
+                cmd.extend(["-P", str(Path(gpu_script).resolve())])  # RUTA ABSOLUTA DEL SCRIPT
             
-            logger.info(f"Ejecutando comando: {' '.join(cmd)}")
+            logger.info(f"Comando de render:")
+            logger.info(f"  Blender: {self.config.blender_path}")
+            logger.info(f"  Archivo: {blend_path}")
+            logger.info(f"  Salida:  {output_dir / 'frame_####'}")
+            logger.info(f"  Frames:  {start_frame} - {end_frame}")
+            if gpu_script:
+                logger.info(f"  GPU Script: {gpu_script}")
             
-            # Ejecutar Blender
-            self.current_process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                universal_newlines=True
-            )
-            
-            # Monitorear progreso
-            frame_count = (frame_end - frame_start) + 1
-            frames_completed = 0
-            
-            while True:
-                # Leer output de Blender
-                output_line = self.current_process.stdout.readline()
+            # Ejecutar render con timeout robusto
+            try:
+                result = subprocess.run(
+                    cmd,
+                    cwd=str(job_dir),  # Directorio de trabajo absoluto
+                    capture_output=True,
+                    text=True,
+                    timeout=3600,  # 1 hora timeout
+                    creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == 'Windows' else 0
+                )
                 
-                if output_line:
-                    line = output_line.strip()
-                    logger.debug(f"Blender: {line}")
+                logger.info("Blender ha finalizado. Analizando resultados...")
+                
+                # Verificar éxito del render
+                if result.returncode == 0:
+                    # Buscar archivos de salida
+                    output_files = []
+                    for file_path in output_dir.iterdir():
+                        if file_path.is_file():
+                            output_files.append(file_path)
                     
-                    # Detectar frame completado
-                    if "Saved:" in line:
-                        frames_completed += 1
-                        progress = int((frames_completed / frame_count) * 100)
-                        
-                        if progress_callback:
-                            await progress_callback(progress, frames_completed, frame_count)
-                        
-                        # Extraer archivo guardado
-                        if "'" in line:
-                            saved_file = line.split("'")[1]
-                            if os.path.exists(saved_file):
-                                output_files.append(saved_file)
-                
-                # Verificar si el proceso terminó
-                if self.current_process.poll() is not None:
-                    break
-                
-                await asyncio.sleep(0.1)
-            
-            # Obtener código de salida
-            return_code = self.current_process.returncode
-            
-            if return_code == 0:
-                logger.info(f"Render completado exitosamente: {job_id}")
-                return True, output_files
-            else:
-                stderr_output = self.current_process.stderr.read()
-                logger.error(f"Render falló: {stderr_output}")
+                    if output_files:
+                        logger.info(f"✓ Render completado exitosamente: {job_id}")
+                        logger.info(f"  Archivos generados: {len(output_files)}")
+                        for f in output_files:
+                            logger.info(f"    - {f.name} ({f.stat().st_size} bytes)")
+                        return True, [str(f) for f in output_files]
+                    else:
+                        logger.error(f"No se generaron archivos de salida para {job_id}")
+                        logger.error(f"Contenido de {output_dir}:")
+                        for item in output_dir.iterdir():
+                            logger.error(f"  - {item}")
+                        return False, []
+                else:
+                    logger.error(f"✗ Blender falló con código {result.returncode}")
+                    logger.error("=== STDOUT ===")
+                    for line in result.stdout.split('\n'):
+                        if line.strip():
+                            logger.error(f"  {line}")
+                    logger.error("=== STDERR ===")
+                    for line in result.stderr.split('\n'):
+                        if line.strip():
+                            logger.error(f"  {line}")
+                    return False, []
+                    
+            except subprocess.TimeoutExpired:
+                logger.error(f"✗ Render de {job_id} excedió el tiempo límite (1 hora)")
+                return False, []
+            except Exception as e:
+                logger.error(f"✗ Error ejecutando Blender: {e}")
                 return False, []
                 
         except Exception as e:
-            logger.error(f"Error ejecutando render {job_id}: {e}")
+            logger.error(f"✗ Error crítico en execute_render para {job_id}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return False, []
-        finally:
-            self.current_process = None
-    
-    def _create_gpu_script(self) -> str:
-        """Crear script para habilitar GPU en Cycles"""
-        gpu_script = """
-import bpy
-import cycles
-
-# Habilitar GPU para Cycles
-bpy.context.scene.render.engine = 'CYCLES'
-bpy.context.scene.cycles.device = 'GPU'
-
-# Configurar dispositivos
-cycles.init()
-prefs = bpy.context.preferences
-cprefs = prefs.addons['cycles'].preferences
-
-# Habilitar todos los dispositivos GPU disponibles
-for device in cprefs.devices:
-    if device.type == 'CUDA' or device.type == 'OPENCL' or device.type == 'OPTIX':
-        device.use = True
-        print(f"GPU habilitada: {device.name}")
-"""
-        
-        script_path = self.config.temp_dir / "gpu_setup.py"
-        with open(script_path, 'w') as f:
-            f.write(gpu_script)
-        
-        return str(script_path)
     
     def cancel_current_render(self):
         """Cancelar render actual"""
@@ -383,7 +473,7 @@ for device in cprefs.devices:
             self.current_process = None
 
 class RenderNode:
-    """Nodo de render principal"""
+    """Nodo de render principal - VERSIÓN DEFINITIVA"""
     
     def __init__(self, config_path: str = "node_config.yaml"):
         self.config_path = config_path
@@ -392,26 +482,49 @@ class RenderNode:
         self.status = "offline"
         self.current_jobs = {}
         self.registered = False
+        self._shutdown = False
         
-        # Inicializar componentes
+        # Inicializar componentes con rutas absolutas
         self.system_monitor = SystemMonitor()
         self.file_transfer = FileTransferManager(self.config.temp_dir, self.config.master_url)
         self.render_executor = RenderExecutor(self.config)
         
-        # Crear directorios necesarios
-        os.makedirs(self.config.temp_dir, exist_ok=True)
-        os.makedirs(self.config.output_dir, exist_ok=True)
+        # Crear directorios necesarios con rutas absolutas
+        temp_dir = Path(self.config.temp_dir).resolve()
+        output_dir = Path(self.config.output_dir).resolve()
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        logger.info(f"Nodo inicializado:")
+        logger.info(f"  ID: {self.node_id}")
+        logger.info(f"  Temp: {temp_dir}")
+        logger.info(f"  Output: {output_dir}")
+        logger.info(f"  Blender: {self.config.blender_path}")
+        
+        # Configurar señales para shutdown limpio
+        self._setup_signal_handlers()
+    
+    def _setup_signal_handlers(self):
+        """Configurar manejadores de señales para shutdown limpio"""
+        def signal_handler(signum, frame):
+            logger.info(f"Recibida señal {signum}, iniciando shutdown...")
+            self._shutdown = True
+        
+        if platform.system() != 'Windows':
+            signal.signal(signal.SIGTERM, signal_handler)
+            signal.signal(signal.SIGINT, signal_handler)
     
     def _load_config(self) -> NodeConfig:
         """Cargar configuración del archivo YAML"""
         try:
             if os.path.exists(self.config_path):
-                with open(self.config_path, 'r') as f:
+                with open(self.config_path, 'r', encoding='utf-8') as f:
                     config_dict = yaml.safe_load(f)
                     return NodeConfig(**config_dict)
             else:
                 # Crear configuración por defecto
                 config = NodeConfig()
+                config.node_name = f"Node-{platform.node()}"
                 self._save_config(config)
                 return config
         except Exception as e:
@@ -421,8 +534,8 @@ class RenderNode:
     def _save_config(self, config: NodeConfig):
         """Guardar configuración al archivo YAML"""
         try:
-            with open(self.config_path, 'w') as f:
-                yaml.dump(asdict(config), f, default_flow_style=False)
+            with open(self.config_path, 'w', encoding='utf-8') as f:
+                yaml.dump(asdict(config), f, default_flow_style=False, allow_unicode=True)
         except Exception as e:
             logger.error(f"Error guardando configuración: {e}")
     
@@ -431,265 +544,421 @@ class RenderNode:
         # Usar hostname + MAC address para generar ID consistente
         hostname = platform.node()
         try:
-            import uuid
             mac = uuid.getnode()
             node_string = f"{hostname}-{mac}"
             return hashlib.md5(node_string.encode()).hexdigest()[:16]
-        except:
+        except Exception:
             return str(uuid.uuid4())[:16]
     
     async def register_with_master(self) -> bool:
-        """Registrar este nodo con el servidor master"""
+        """Registrar nodo con el servidor master"""
         try:
-            node_info = self.system_monitor.get_node_info()
-            system_stats = self.system_monitor.get_system_stats()
-            
-            registration_data = {
+            node_info = {
                 "node_id": self.node_id,
-                "node_name": self.config.node_name or f"Node-{self.node_id[:8]}",
-                "node_info": node_info,
-                "system_stats": asdict(system_stats),
-                "config": {
+                "node_name": self.config.node_name or f"Node-{platform.node()}",
+                "capabilities": {
                     "max_concurrent_jobs": self.config.max_concurrent_jobs,
+                    "blender_available": os.path.exists(self.config.blender_path),
                     "gpu_enabled": self.config.gpu_enabled,
                     "cpu_cores": self.config.cpu_cores,
-                    "max_memory_gb": self.config.max_memory_gb,
                     "tags": self.config.tags
                 },
-                "capabilities": {
-                    "blender_available": os.path.exists(self.config.blender_path),
-                    "gpu_rendering": self.config.gpu_enabled and system_stats.gpu_count > 0,
-                    "concurrent_jobs": self.config.max_concurrent_jobs
-                }
+                "system_info": {
+                    "platform": platform.platform(),
+                    "cpu_count": psutil.cpu_count(),
+                    "memory_total": psutil.virtual_memory().total,
+                    "blender_path": self.config.blender_path
+                },
+                "status": "online"
             }
             
-            async with aiohttp.ClientSession() as session:
-                url = f"{self.config.master_url}/api/v1/nodes/register"
-                async with session.post(url, json=registration_data) as response:
+            connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
+            timeout = aiohttp.ClientTimeout(total=30, connect=10)
+            
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                register_url = f"{self.config.master_url}/api/v1/nodes/register"
+                
+                async with session.post(register_url, json=node_info) as response:
                     if response.status == 200:
-                        result = await response.json()
-                        logger.info(f"Nodo registrado exitosamente: {result}")
                         self.registered = True
-                        self.status = "idle"
+                        self.status = "online"
+                        logger.info(f"✓ Nodo registrado exitosamente: {self.node_id}")
                         return True
                     else:
-                        logger.error(f"Error registrando nodo: HTTP {response.status}")
+                        logger.error(f"✗ Error registrando nodo: HTTP {response.status}")
+                        response_text = await response.text()
+                        logger.error(f"Respuesta del servidor: {response_text}")
                         return False
                         
         except Exception as e:
-            logger.error(f"Error registrando con master: {e}")
+            logger.error(f"✗ Error registrando nodo: {e}")
             return False
     
-    async def send_heartbeat(self):
+    async def send_heartbeat(self) -> bool:
         """Enviar heartbeat al master"""
-        if not self.registered:
-            return
-            
         try:
-            system_stats = self.system_monitor.get_system_stats()
+            if not self.registered:
+                return False
+            
+            stats = self.system_monitor.get_system_stats()
             
             heartbeat_data = {
                 "node_id": self.node_id,
                 "status": self.status,
-                "system_stats": asdict(system_stats),
-                "active_jobs": len(self.current_jobs),
-                "job_statuses": {job_id: asdict(job_status) 
-                               for job_id, job_status in self.current_jobs.items()},
+                "system_stats": asdict(stats),
+                "current_jobs": [
+                    {
+                        "job_id": job_id,
+                        "status": job.status,
+                        "progress": job.progress,
+                        "frame_current": job.frame_current,
+                        "frame_total": job.frame_total
+                    }
+                    for job_id, job in self.current_jobs.items()
+                ],
                 "timestamp": datetime.now().isoformat()
             }
             
-            async with aiohttp.ClientSession() as session:
-                url = f"{self.config.master_url}/api/v1/nodes/heartbeat"
-                async with session.post(url, json=heartbeat_data) as response:
-                    if response.status != 200:
-                        logger.warning(f"Error enviando heartbeat: HTTP {response.status}")
+            connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
+            timeout = aiohttp.ClientTimeout(total=15, connect=5)
+            
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                heartbeat_url = f"{self.config.master_url}/api/v1/nodes/{self.node_id}/heartbeat"
+                
+                async with session.post(heartbeat_url, json=heartbeat_data) as response:
+                    if response.status == 200:
+                        return True
+                    else:
+                        logger.warning(f"Heartbeat falló: HTTP {response.status}")
+                        return False
                         
+        except asyncio.TimeoutError:
+            logger.warning("Heartbeat timeout")
+            return False
         except Exception as e:
             logger.error(f"Error enviando heartbeat: {e}")
+            return False
     
-    async def poll_for_jobs(self):
-        """Consultar por nuevos trabajos"""
-        if not self.registered or len(self.current_jobs) >= self.config.max_concurrent_jobs:
-            return
-            
+    async def poll_for_jobs(self) -> Optional[Dict]:
+        """Polling por nuevos trabajos"""
         try:
-            async with aiohttp.ClientSession() as session:
-                url = f"{self.config.master_url}/api/v1/nodes/{self.node_id}/poll-job"
-                async with session.get(url) as response:
+            if not self.registered or len(self.current_jobs) >= self.config.max_concurrent_jobs:
+                return None
+            
+            connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
+            timeout = aiohttp.ClientTimeout(total=15, connect=5)
+            
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                poll_url = f"{self.config.master_url}/api/v1/nodes/{self.node_id}/poll"
+                
+                async with session.get(poll_url) as response:
                     if response.status == 200:
                         job_data = await response.json()
-                        if job_data:
-                            await self._process_new_job(job_data)
+                        if job_data and 'job_id' in job_data:
+                            return job_data
                     elif response.status != 204:  # 204 = No jobs available
-                        logger.warning(f"Error consultando trabajos: HTTP {response.status}")
-                        
+                        logger.warning(f"Job polling falló: HTTP {response.status}")
+            
+            return None
+            
+        except asyncio.TimeoutError:
+            logger.warning("Job polling timeout")
+            return None
         except Exception as e:
-            logger.error(f"Error consultando trabajos: {e}")
+            logger.error(f"Error polling trabajos: {e}")
+            return None
     
-    async def _process_new_job(self, job_data: Dict):
-        """Procesar un nuevo trabajo asignado"""
-        job_id = job_data["job_id"]
-        logger.info(f"Nuevo trabajo asignado: {job_id}")
+    async def process_job(self, job_data: Dict):
+        """Procesar un trabajo de render - VERSIÓN DEFINITIVA"""
+        job_id = job_data['job_id']
         
-        # Crear estado del trabajo
         job_status = JobStatus(
             job_id=job_id,
             status="downloading",
-            start_time=datetime.now()
+            start_time=datetime.now(),
+            frame_total=job_data.get('end_frame', 1) - job_data.get('start_frame', 1) + 1
         )
+        
         self.current_jobs[job_id] = job_status
         
-        # Ejecutar trabajo en background
-        asyncio.create_task(self._execute_job_workflow(job_id, job_data))
-    
-    async def _execute_job_workflow(self, job_id: str, job_data: Dict):
-        """Ejecutar workflow completo de un trabajo"""
-        job_status = self.current_jobs[job_id]
-        
         try:
-            # Fase 1: Descargar archivos
+            logger.info(f"🎬 Procesando trabajo {job_id}")
+            
+            # 1. Descargar archivos
             job_status.status = "downloading"
-            blend_file = await self.file_transfer.download_job_files(job_id, job_data)
+            blend_file = await self.file_transfer.download_job_files(job_id)
             
-            # Fase 2: Renderizar
+            if not blend_file:
+                raise Exception("Error descargando archivos")
+            
+            # 2. Ejecutar render
             job_status.status = "rendering"
-            
-            async def progress_callback(progress, frame_current, frame_total):
-                job_status.progress = progress
-                job_status.frame_current = frame_current
-                job_status.frame_total = frame_total
-            
             success, output_files = await self.render_executor.execute_render(
-                job_id, blend_file, job_data, progress_callback
+                job_id, blend_file, job_data
             )
             
-            if success:
-                # Fase 3: Subir resultados
+            if success and output_files:
+                # 3. Subir resultados
                 job_status.status = "uploading"
-                upload_success = await self.file_transfer.upload_results(job_id, output_files)
-                
-                if upload_success:
+                if await self.file_transfer.upload_results(job_id, output_files):
                     job_status.status = "completed"
                     job_status.progress = 100
-                    job_status.output_files = output_files
+                    logger.info(f"✓ Trabajo {job_id} completado exitosamente")
                 else:
-                    job_status.status = "failed"
-                    job_status.error_message = "Error subiendo resultados"
+                    raise Exception("Error subiendo resultados")
             else:
-                job_status.status = "failed"
-                job_status.error_message = "Error durante el render"
+                raise Exception("Error durante el render")
             
         except Exception as e:
-            logger.error(f"Error ejecutando trabajo {job_id}: {e}")
+            logger.error(f"✗ Error ejecutando trabajo {job_id}: {e}")
             job_status.status = "failed"
             job_status.error_message = str(e)
         
         finally:
             job_status.end_time = datetime.now()
             
-            # Limpiar archivos temporales después de un tiempo
-            await asyncio.sleep(300)  # 5 minutos
-            self.file_transfer.cleanup_job_files(job_id)
-            
+            # Notificar al master sobre el estado final del trabajo
+            await self.update_job_status_on_master(job_status)
+
+            # --- CORRECCIÓN: Llamar a la función de limpieza correcta ---
+            # La función se llama _cleanup_job_delayed y no es parte de la clase.
+            asyncio.create_task(self._cleanup_job_delayed(job_id))
+            # -----------------------------------------------------------
+
             # Remover trabajo de la lista activa
             if job_id in self.current_jobs:
                 del self.current_jobs[job_id]
-    
+
+    async def update_job_status_on_master(self, job_status: JobStatus):
+        """Notifica al servidor master sobre el estado final de un trabajo."""
+        logger.info(f"Notificando al servidor sobre el estado final del trabajo {job_status.job_id}")
+        status_data = asdict(job_status)
+
+        if status_data.get('start_time'):
+            status_data['start_time'] = status_data['start_time'].isoformat()
+        if status_data.get('end_time'):
+            status_data['end_time'] = status_data['end_time'].isoformat()
+        
+        url = f"{self.config.master_url}/api/v1/jobs/{job_status.job_id}/update-status"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=status_data) as response:
+                    if response.status == 200:
+                        logger.info(f"Estado del trabajo {job_status.job_id} actualizado en servidor")
+                    else:
+                        logger.error(f"Error actualizando estado en servidor: HTTP {response.status}")
+        except Exception as e:
+            logger.error(f"No se pudo notificar al servidor: {e}")
+
+        url = f"{self.config.master_url}/api/v1/jobs/{job_status.job_id}/update-status"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=status_data) as response:
+                    if response.status != 200:
+                        logger.error(f"Error actualizando estado en servidor: HTTP {response.status}")
+        except Exception as e:
+            logger.error(f"No se pudo notificar al servidor: {e}")
+
+    # --- FUNCIÓN AÑADIDA ---
+    async def _cleanup_job_later(self, job_id: str):
+        """Limpiar archivos después de un delay sin bloquear el nodo"""
+        await asyncio.sleep(10)
+        self.file_transfer.cleanup_job_files(job_id)
+
     async def start(self):
         """Iniciar el nodo de render"""
         logger.info("Iniciando nodo de render...")
-        
-        # Verificar configuración
-        if not os.path.exists(self.config.blender_path):
-            logger.error(f"Blender no encontrado en: {self.config.blender_path}")
+        if not await self.register_with_master():
+            logger.error("No se pudo registrar con el servidor. Saliendo.")
             return
-        
-        # Registrar con master
-        logger.info("Registrando con servidor master...")
-        max_retries = 5
-        for attempt in range(max_retries):
-            if await self.register_with_master():
-                break
-            logger.warning(f"Intento {attempt + 1}/{max_retries} fallido, reintentando en 10s...")
-            await asyncio.sleep(10)
-        else:
-            logger.error("No se pudo registrar con el servidor master")
-            return
-        
-        logger.info(f"Nodo iniciado exitosamente: {self.node_id}")
-        
-        # Loops principales
-        heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-        job_polling_task = asyncio.create_task(self._job_polling_loop())
-        
-        try:
-            await asyncio.gather(heartbeat_task, job_polling_task)
-        except KeyboardInterrupt:
-            logger.info("Deteniendo nodo...")
-            heartbeat_task.cancel()
-            job_polling_task.cancel()
-    
-    async def _heartbeat_loop(self):
-        """Loop de heartbeat"""
-        while True:
+        logger.info("Nodo iniciado exitosamente. Esperando trabajos...")
+        while not self._shutdown:
+            await self.send_heartbeat()
+            await self.poll_for_jobs()
+            await asyncio.sleep(self.config.heartbeat_interval)
+
+    async def start(self):
+            """Iniciar el nodo de render"""
+            logger.info("Iniciando nodo de render...")
+            
+            # Verificar configuración crítica
+            if not self.config.blender_path:
+                logger.error("Ruta de Blender no configurada en node_config.yaml")
+                return
+                
+            if not os.path.exists(self.config.blender_path):
+                logger.error(f"Blender no encontrado en: {self.config.blender_path}")
+                return
+            
+            logger.info(f"Blender verificado: {self.config.blender_path}")
+            
+            # Registrar con master
+            logger.info("Registrando con servidor master...")
+            max_retries = 5
+            for attempt in range(max_retries):
+                if await self.register_with_master():
+                    break
+                logger.warning(f"Intento {attempt + 1}/{max_retries} fallido, reintentando en 10s...")
+                await asyncio.sleep(10)
+            else:
+                logger.error("No se pudo registrar con el servidor master")
+                return
+            
+            logger.info(f"Nodo iniciado exitosamente: {self.node_id}")
+            logger.info("Esperando trabajos de render...")
+            
+            # Loops principales
             try:
-                await self.send_heartbeat()
+                await asyncio.gather(
+                    self._heartbeat_loop(),
+                    self._job_polling_loop(),
+                    return_exceptions=True
+                )
+            except Exception as e:
+                logger.error(f"Error en loops principales: {e}")
+            finally:
+                logger.info("Nodo detenido")
+
+    async def _heartbeat_loop(self):
+        """Loop principal de heartbeat"""
+        while not self._shutdown:
+            try:
+                if self.registered:
+                    await self.send_heartbeat()
                 await asyncio.sleep(self.config.heartbeat_interval)
-            except asyncio.CancelledError:
-                break
             except Exception as e:
                 logger.error(f"Error en heartbeat loop: {e}")
-                await asyncio.sleep(5)
-    
+                await asyncio.sleep(self.config.heartbeat_interval)
+
     async def _job_polling_loop(self):
-        """Loop de consulta de trabajos"""
-        while True:
+        """Loop principal de polling de trabajos"""
+        while not self._shutdown:
             try:
-                await self.poll_for_jobs()
-                await asyncio.sleep(5)  # Consultar cada 5 segundos
-            except asyncio.CancelledError:
-                break
+                if self.registered and len(self.current_jobs) < self.config.max_concurrent_jobs:
+                    job_data = await self.poll_for_jobs()
+                    if job_data:
+                        # Procesar trabajo en background
+                        asyncio.create_task(self.process_job(job_data))
+                
+                await asyncio.sleep(5)  # Poll cada 5 segundos
+                
             except Exception as e:
                 logger.error(f"Error en job polling loop: {e}")
                 await asyncio.sleep(10)
 
-# Configuración de ejemplo
-def create_sample_config():
-    """Crear configuración de ejemplo"""
-    config = NodeConfig(
-        node_name="RenderNode-001",
-        master_url="http://192.168.1.100:8000",
-        node_port=8001,
-        max_concurrent_jobs=1,
-        temp_dir="./temp_renders",
-        output_dir="./completed_renders",
-        blender_path="/usr/bin/blender",  # Ajustar según OS
-        heartbeat_interval=10,
-        auto_start=True,
-        gpu_enabled=True,
-        cpu_cores=-1,
-        max_memory_gb=8,
-        priority_weight=1.0,
-        tags=["gpu", "cycles", "production"]
-    )
-    
-    with open("node_config.yaml", "w") as f:
-        yaml.dump(asdict(config), f, default_flow_style=False)
-    
-    print("Configuración de ejemplo creada en node_config.yaml")
+    async def _cleanup_job_delayed(self, job_id: str):
+        """Limpiar archivos después de un delay sin bloquear el nodo"""
+        await asyncio.sleep(60)  # Esperar 1 minuto
+        self.file_transfer.cleanup_job_files(job_id)
+        logger.info(f"Archivos limpiados para {job_id}")
+
 
 if __name__ == "__main__":
-    import argparse
+    # Debug: Imprimir información básica
+    print("🔍 INICIANDO DEBUG...")
+    print(f"📂 Directorio actual: {os.getcwd()}")
+    print(f"🐍 Python: {sys.version}")
+    print(f"🖥️  Sistema: {platform.system()}")
     
-    parser = argparse.ArgumentParser(description="Nodo de Render Distribuido")
-    parser.add_argument("--config", default="node_config.yaml", help="Archivo de configuración")
-    parser.add_argument("--create-config", action="store_true", help="Crear configuración de ejemplo")
+    # Verificar dependencias críticas
+    try:
+        import yaml
+        print("✓ PyYAML importado")
+    except ImportError as e:
+        print(f"❌ Error importando PyYAML: {e}")
+        sys.exit(1)
     
-    args = parser.parse_args()
+    try:
+        import aiohttp
+        print("✓ aiohttp importado")
+    except ImportError as e:
+        print(f"❌ Error importando aiohttp: {e}")
+        sys.exit(1)
     
-    if args.create_config:
-        create_sample_config()
+    try:
+        import psutil
+        print("✓ psutil importado")
+    except ImportError as e:
+        print(f"❌ Error importando psutil: {e}")
+        sys.exit(1)
+    
+    # Verificar Python
+    if sys.version_info < (3, 7):
+        print("❌ Python 3.7+ requerido")
+        sys.exit(1)
     else:
-        # Iniciar nodo
-        node = RenderNode(args.config)
-        asyncio.run(node.start())
+        print(f"✓ Python {sys.version_info.major}.{sys.version_info.minor} OK")
+    
+    # Verificar archivo de configuración
+    config_file = "node_config.yaml"
+    if os.path.exists(config_file):
+        print(f"✓ Configuración encontrada: {config_file}")
+        try:
+            with open(config_file, 'r', encoding='utf-8') as f:
+                config = yaml.safe_load(f)
+                print(f"  - Blender path: {config.get('blender_path', 'NO CONFIGURADO')}")
+                print(f"  - Master URL: {config.get('master_url', 'NO CONFIGURADO')}")
+        except Exception as e:
+            print(f"⚠ Error leyendo configuración: {e}")
+    else:
+        print(f"⚠ No se encontró {config_file}")
+    
+    print("=" * 50)
+    print("🎬 Render Queue Manager - Nodo de Render")
+    print("=" * 50)
+    print(f"🖥️  Sistema: {platform.system()} {platform.release()}")
+    print(f"🐍 Python: {sys.version}")
+    print(f"📂 Directorio: {os.getcwd()}")
+    print("🚀 Iniciando...")
+    print("=" * 50)
+    
+    # Configurar event loop para Windows
+    if platform.system() == 'Windows':
+        try:
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+            print("✓ Windows ProactorEventLoop configurado")
+        except Exception as e:
+            print(f"⚠ Error configurando event loop: {e}")
+    
+    # Función main con manejo de errores detallado
+    async def main_debug():
+        """Función principal con debug"""
+        try:
+            print("🔧 Creando instancia RenderNode...")
+            node = RenderNode()
+            print("✓ RenderNode creado")
+            
+            print("🚀 Iniciando nodo...")
+            await node.start()
+            
+        except KeyboardInterrupt:
+            print("\n🛑 Shutdown por interrupción de usuario")
+        except ImportError as e:
+            print(f"❌ Error de importación: {e}")
+            print("💡 Instala dependencias: pip install PyYAML aiohttp psutil")
+        except FileNotFoundError as e:
+            print(f"❌ Archivo no encontrado: {e}")
+        except yaml.YAMLError as e:
+            print(f"❌ Error en archivo YAML: {e}")
+            print("💡 Revisa la sintaxis de node_config.yaml")
+        except Exception as e:
+            print(f"❌ Error inesperado: {type(e).__name__}: {e}")
+            import traceback
+            print("🔍 Stack trace completo:")
+            traceback.print_exc()
+    
+    # Ejecutar con manejo completo de errores
+    try:
+        asyncio.run(main_debug())
+    except KeyboardInterrupt:
+        print("\n🛑 Shutdown por usuario")
+    except Exception as e:
+        print(f"❌ Error en main loop: {type(e).__name__}: {e}")
+        import traceback
+        print("🔍 Stack trace:")
+        traceback.print_exc()
+    finally:
+        print("👋 Nodo terminado")
+        
+    # Pausa para ver el output
+    input("\n📖 Presiona Enter para cerrar...")

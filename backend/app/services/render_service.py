@@ -128,54 +128,62 @@ class RenderService:
         }
     
     async def _execute_blender_render(
-        self, 
-        job_id: str, 
-        blend_file: str, 
+        self,
+        job_id: str,
+        blend_file: str,
         config: Dict[str, Any],
-        progress_callback: Optional[Callable] = None
+        progress_callback: Optional[Callable] = None,
     ) -> bool:
         """Ejecutar el proceso de render de Blender"""
-        
+
         current_blender = blender_service.get_current_blender_path()
-        
+
         # Construir comando de Blender
         if config["use_blend_output"]:
             # Usar configuración interna del .blend
             cmd = [
                 current_blender,
-                "-b",  # Background mode
+                "-b",
                 blend_file,
                 "-s", str(config["frame_start"]),
                 "-e", str(config["frame_end"]),
-                "-a"  # Render animation
+                "-a",
             ]
         else:
             # Especificar output pattern
             cmd = [
                 current_blender,
-                "-b",  # Background mode
+                "-b",
                 blend_file,
                 "-o", config["output_pattern"],
                 "-s", str(config["frame_start"]),
                 "-e", str(config["frame_end"]),
-                "-a"  # Render animation
+                "-a",
             ]
-        
+
         # Añadir configuraciones adicionales según el motor
         cmd.extend(self._get_engine_specific_args(config))
-        
+
+        # Entorno y carpeta de trabajo (importante para rutas relativas)
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        cwd = os.path.dirname(blend_file) or None
+
         logger.info(f"🎬 Ejecutando: {' '.join(cmd)}")
-        
+        logger.debug(f"cwd={cwd}")
+
         try:
-            # Ejecutar proceso
             if platform.system() == "Windows":
                 process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
-                    universal_newlines=True,
-                    creationflags=subprocess.CREATE_NO_WINDOW
+                    encoding="utf-8",
+                    errors="replace",
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                    cwd=cwd,
+                    env=env,
                 )
             else:
                 process = subprocess.Popen(
@@ -183,25 +191,35 @@ class RenderService:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
-                    universal_newlines=True
+                    encoding="utf-8",
+                    errors="replace",
+                    cwd=cwd,
+                    env=env,
                 )
-            
+
             # Guardar proceso para posible cancelación
             self.active_processes[job_id] = process
-            
+
             # Monitorear progreso en tiempo real
             success = await self._monitor_render_progress(
-                job_id, 
-                process, 
+                job_id,
+                process,
                 config,
-                progress_callback
+                progress_callback,
             )
-            
             return success
-            
+
         except Exception as e:
             logger.error(f"❌ Error ejecutando Blender para {job_id}: {e}")
             return False
+
+        finally:
+            # Limpieza de la referencia del proceso
+            try:
+                self.active_processes.pop(job_id, None)
+            except Exception:
+                pass
+
     
     def _get_engine_specific_args(self, config: Dict[str, Any]) -> list:
         """Obtener argumentos específicos del motor de render"""
