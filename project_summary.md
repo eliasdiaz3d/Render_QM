@@ -1,0 +1,290 @@
+# Resumen del proyecto: Render_QM - Render Queue Manager
+
+- Ruta: `D:\Render_QM\Render_QM`
+- Archivos .py: **220**
+
+## Estructura (primer nivel)
+`.git`, `app`, `backend`, `blender_addon`, `build`, `config`, `deploy`, `dist`, `docs`, `frontend`, `logs`, `monitoring`, `node_client`, `notification_services`, `renders`, `scripts`, `shared`, `temp`, `tests`
+
+## Dependencias (requirements)
+- PyYAML==6.0.2
+- SQLAlchemy==2.0.23
+- aiofiles==23.2.1
+- aiohappyeyeballs==2.6.1
+- aiohttp==3.12.15
+- aiosignal==1.4.0
+- annotated-types==0.7.0
+- anyio==3.7.1
+- async-timeout==5.0.1
+- attrs==25.3.0
+- bcrypt==4.3.0
+- click==8.2.1
+- colorama==0.4.6
+- dnspython==2.7.0
+- email-validator==2.3.0
+- exceptiongroup==1.3.0
+- fastapi==0.104.1
+- frozenlist==1.7.0
+- greenlet==3.2.4
+- h11==0.16.0
+- httptools==0.6.4
+- idna==3.10
+- multidict==6.6.4
+- passlib==1.7.4
+- propcache==0.3.2
+- psutil==7.0.0
+- pydantic-settings==2.1.0
+- pydantic==2.11.7
+- pydantic==2.5.0
+- pydantic_core==2.33.2
+- python-dotenv==1.0.0
+- python-jose[cryptography]==3.3.0
+- python-multipart==0.0.6
+- sniffio==1.3.1
+- starlette==0.27.0
+- typing-inspection==0.4.1
+- typing_extensions==4.15.0
+- uvicorn==0.24.0
+- uvicorn[standard]==0.24.0
+- watchfiles==1.1.0
+- websockets==15.0.1
+- yarl==1.20.1
+
+## Imports más comunes
+- app: 54
+- datetime: 42
+- typing: 37
+- pathlib: 30
+- fastapi: 29
+- os: 28
+- subprocess: 16
+- pydantic: 16
+- platform: 14
+- json: 14
+- asyncio: 14
+- core: 14
+- sqlalchemy: 12
+- shutil: 12
+- bpy: 11
+- re: 10
+- sys: 8
+- uuid: 8
+- logging: 8
+- email: 8
+- traceback: 7
+- models: 7
+- passlib: 6
+- aiohttp: 6
+- time: 5
+
+## Stack detectado
+- FastAPI: sí
+- SQLAlchemy: sí
+- Pydantic: sí
+- Uvicorn: sí
+- Blender (bpy): sí
+- Docker: sí (docker-compose.yml, backend\docker-compose.yml, backend\Dockerfile)
+- Alembic: sí (backend\alembic.ini)
+
+## Posibles entrypoints / scripts
+- `app/main.py`
+- `backend/app/main.py`
+- `backend/app/main_working.py`
+- `backend/main.py`
+- `backend\scripts\backup_db.py`
+- `backend\scripts\health_check.py`
+- `backend\scripts\migrate_db.py`
+- `backend\scripts\setup_master.py`
+- `backend\scripts\setup_node.py`
+- `install_render_node.py`
+- `scripts\build_addon.py`
+- `scripts\dev_setup.py`
+- `scripts\install_dependencies.py`
+- `scripts\migrate_data.py`
+- `scripts\package_release.py`
+- `scripts\run_tests.py`
+
+## Variables de entorno
+- Archivos .env: .env, backend\.env
+- Nombres referenciados:
+  - `USER`
+  - `USERNAME`
+
+## Endpoints detectados (heurístico)
+- **D:\Render_QM\Render_QM\app\api\v1\auth.py**
+  - POST /login
+  - GET /me
+- **D:\Render_QM\Render_QM\app\api\v1\config.py**
+  - POST /blender/auto-detect
+  - POST /blender/test
+  - GET /blender/status
+- **D:\Render_QM\Render_QM\app\api\v1\jobs.py**
+  - POST /jobs/upload
+  - POST /jobs/upload-distributed
+  - GET /jobs
+  - GET /jobs/{job_id}
+  - POST /jobs/search
+  - PUT /jobs/{job_id}
+  - DELETE /jobs/{job_id}
+  - POST /jobs/{job_id}/cancel
+  - POST /jobs/{job_id}/resume
+  - GET /jobs/{job_id}/download
+  - GET /jobs/{job_id}/download-all
+  - GET /jobs/{job_id}/frames
+  - GET /jobs/{job_id}/preview
+  - POST /blend/analyze
+  - GET /queue/status
+  - GET /jobs/statistics
+  - GET /jobs/{job_id}/logs
+  - POST /jobs/export
+  - POST /jobs/cleanup
+  - GET /jobs/health
+- **D:\Render_QM\Render_QM\app\api\v1\nodes.py**
+  - POST /nodes/register
+  - GET /jobs/{job_id}/download-blend
+  - POST /jobs/{job_id}/upload-result
+  - GET /nodes/status
+  - GET /nodes/{node_id}
+  - POST /nodes/search
+  - PUT /nodes/{node_id}
+  - DELETE /nodes/{node_id}
+  - POST /nodes/{node_id}/maintenance
+  - GET /nodes/overview
+  - GET /nodes/{node_id}/diagnostic
+  - GET /queue/distributed-status
+  - POST /nodes/cleanup
+  - POST /nodes/heartbeat
+  - GET /nodes/{node_id}/poll-job
+- **D:\Render_QM\Render_QM\app\api\v1\notifications.py**
+  - POST /send
+- **D:\Render_QM\Render_QM\app\api\v1\queue.py**
+  - GET /status
+- **D:\Render_QM\Render_QM\app\api\v1\settings.py**
+  - POST /config/blender/auto-detect
+  - POST /config/blender/test
+  - POST /config/blender/save
+- **D:\Render_QM\Render_QM\backend\main.py**
+  - POST /api/v1/blend/analyze
+  - GET /api/v1/jobs/{job_id}/download-result
+  - POST /api/v1/jobs/{job_id}/upload-result
+  - GET /api/v1/jobs/{job_id}/download
+  - POST /api/v1/nodes/cleanup
+  - GET /api/v1/nodes/stats
+  - GET /api/v1/jobs/{job_id}/frames
+  - GET /api/v1/jobs/{job_id}/frame/{frame_num}
+  - GET /api/v1/jobs/{job_id}/download-all
+  - GET /api/v1/auth/me
+  - GET /api/v1/config/queue
+  - POST /api/v1/config/queue
+  - GET /api/v1/system/info
+  - GET /api/v1/jobs/{job_id}/download-first-frame
+  - POST /api/v1/config/blender/test
+  - POST /api/v1/config/blender/auto-detect
+  - POST /api/v1/config/blender
+  - POST /api/v1/nodes/{node_id}/heartbeat
+  - GET /api/v1/nodes/{node_id}/poll
+  - GET /
+  - GET /health
+  - GET /api/v1/config/blender
+  - POST /api/v1/config/blender/scan
+  - POST /api/v1/config/blender/verify
+  - POST /api/v1/config/blender/set
+  - GET /api/v1/config/blender/reset
+  - POST /api/v1/jobs/upload
+  - POST /api/v1/upload/start
+  - POST /api/v1/upload/chunk/{session_id}
+  - POST /api/v1/upload/complete/{session_id}
+  - DELETE /api/v1/upload/cancel/{session_id}
+  - GET /api/v1/jobs
+  - GET /api/v1/jobs/{job_id}
+  - DELETE /api/v1/jobs/{job_id}
+  - POST /api/v1/jobs/{job_id}/cancel
+  - GET /api/v1/jobs/{job_id}/preview
+  - GET /api/v1/jobs/{job_id}/download-blend
+  - POST /api/v1/jobs/{job_id}/upload-result
+  - POST /api/v1/jobs/{job_id}/update-status
+  - POST /api/v1/nodes/register
+  - POST /api/v1/nodes/heartbeat
+  - GET /api/v1/nodes/{node_id}/poll
+  - GET /api/v1/nodes/{node_id}/poll-job
+  - GET /api/v1/queue/status
+  - GET /api/v1/nodes
+  - GET /api/v1/stats/dashboard
+  - GET /api/v1/system/blender-info
+- **D:\Render_QM\Render_QM\backend\app\main.py**
+  - GET /
+  - GET /health
+- **D:\Render_QM\Render_QM\backend\app\main_working.py**
+  - GET /
+  - GET /health
+- **D:\Render_QM\Render_QM\backend\app\api\v1\auth.py**
+  - POST /login
+  - GET /me
+  - POST /register
+  - GET /users
+- **D:\Render_QM\Render_QM\backend\app\api\v1\config.py**
+  - POST /blender/auto-detect
+  - POST /blender/test-version
+  - GET /blender
+  - POST /blender
+  - POST /blender/validate
+  - GET /queue
+  - POST /queue
+- **D:\Render_QM\Render_QM\backend\app\api\v1\jobs.py**
+  - POST /jobs/upload
+  - POST /jobs/upload-distributed
+  - GET /jobs
+  - GET /jobs/{job_id}
+  - POST /jobs/search
+  - PUT /jobs/{job_id}
+  - DELETE /jobs/{job_id}
+  - POST /jobs/{job_id}/cancel
+  - POST /jobs/{job_id}/resume
+  - GET /jobs/{job_id}/download
+  - GET /jobs/{job_id}/download-all
+  - GET /jobs/{job_id}/frames
+  - GET /jobs/{job_id}/preview
+  - POST /blend/analyze
+  - GET /queue/status
+  - GET /jobs/statistics
+  - GET /jobs/{job_id}/logs
+  - POST /jobs/export
+  - POST /jobs/cleanup
+  - GET /jobs/health
+- **D:\Render_QM\Render_QM\backend\app\api\v1\nodes.py**
+  - POST /nodes/register
+  - GET /jobs/{job_id}/download-blend
+  - POST /jobs/{job_id}/upload-result
+  - GET /nodes/status
+  - GET /nodes/{node_id}
+  - POST /nodes/search
+  - PUT /nodes/{node_id}
+  - DELETE /nodes/{node_id}
+  - POST /nodes/{node_id}/maintenance
+  - GET /nodes/overview
+  - GET /nodes/{node_id}/diagnostic
+  - GET /queue/distributed-status
+  - POST /nodes/cleanup
+  - POST /nodes/heartbeat
+  - GET /nodes/{node_id}/poll-job
+- **D:\Render_QM\Render_QM\backend\app\api\v1\notifications.py**
+  - POST /send
+- **D:\Render_QM\Render_QM\backend\app\api\v1\queue.py**
+  - GET /status
+  - GET /jobs
+  - POST /jobs/{job_id}/priority
+  - POST /jobs/{job_id}/cancel
+  - POST /process
+  - GET /metrics
+  - POST /clear
+- **D:\Render_QM\Render_QM\backend\app\api\v1\settings.py**
+  - GET /
+- **D:\Render_QM\Render_QM\backend\scripts\setup_master.py**
+  - POST /register
+  - POST /login
+  - GET /me
+  - POST /logout
+
+## Bases de datos SQLite encontradas
+- `backend\render_qm.db`
+- `backend\render_queue.db`

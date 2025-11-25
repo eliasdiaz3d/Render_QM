@@ -281,26 +281,27 @@ export default {
       nodes: [],
       isLoading: false,
       showNodeModal: false,
-      selectedNode: null
+      selectedNode: null,
+      refreshInterval: null
     }
   },
   computed: {
     activeNodes() {
-      return this.nodes.filter(node => node.status === 'online').length;
+      return this.nodes.filter(node => node.status === 'online' || node.status === 'rendering' || node.status === 'idle').length;
     },
     inactiveNodes() {
-      return this.nodes.filter(node => node.status !== 'online').length;
+      return this.nodes.filter(node => node.status !== 'online' && node.status !== 'rendering' && node.status !== 'idle').length;
     },
     totalCpuCores() {
       return this.nodes.reduce((total, node) => {
-        return total + (node.system_info?.cpu_cores || 0);
+        return total + (node.system_info?.cpu_cores_logical || 0);
       }, 0);
     },
     totalMemory() {
       const total = this.nodes.reduce((sum, node) => {
         return sum + (node.system_info?.memory_total_gb || 0);
       }, 0);
-      return `${total}GB`;
+      return `${Math.round(total)}GB`;
     }
   },
   async mounted() {
@@ -321,7 +322,15 @@ export default {
       try {
         const response = await fetch('http://localhost:8000/api/v1/nodes');
         if (response.ok) {
-          this.nodes = await response.json();
+          const data = await response.json();
+          // Procesar datos para la UI
+          this.nodes = data.map(node => ({
+            ...node,
+            cpu_usage: node.system_stats?.cpu_percent || 0,
+            memory_usage: node.system_stats?.memory_percent || 0,
+            blender_available: node.capabilities?.blender_available || false,
+            platform: node.node_info?.platform || 'N/A'
+          }));
         }
       } catch (error) {
         console.error('Error loading nodes:', error);
@@ -337,6 +346,7 @@ export default {
     getStatusIcon(status) {
       const icons = {
         online: '🟢',
+        idle: '🟢',
         offline: '🔴',
         rendering: '⚙️'
       };
@@ -346,6 +356,7 @@ export default {
     getStatusText(status) {
       const texts = {
         online: 'En línea',
+        idle: 'Libre',
         offline: 'Fuera de línea',
         rendering: 'Renderizando'
       };
@@ -355,6 +366,7 @@ export default {
     getStatusClass(status) {
       const classes = {
         online: 'bg-green-100 text-green-800',
+        idle: 'bg-green-100 text-green-800',
         offline: 'bg-red-100 text-red-800',
         rendering: 'bg-blue-100 text-blue-800'
       };

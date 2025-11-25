@@ -167,11 +167,6 @@
 
         <!-- Configuración de Notificaciones -->
         <div v-show="activeTab === 'notifications'" class="space-y-6">
-          <!-- ... contenido notificaciones existente ... -->
-        </div>
-
-        <!-- Configuración de Notificaciones -->
-        <div v-show="activeTab === 'notifications'" class="space-y-6">
           <div class="bg-gray-800 rounded-lg p-6">
             <h3 class="text-xl font-semibold text-white mb-4">🔔 Configuración de Notificaciones</h3>
             
@@ -483,8 +478,13 @@
 </template>
 
 <script>
+import BlenderConfig from '../components/BlenderConfig.vue'
+
 export default {
   name: 'Settings',
+  components: {
+    BlenderConfig
+  },
   data() {
     return {
       activeTab: 'general',
@@ -688,7 +688,6 @@ export default {
       alert('📄 Exportando logs del sistema...')
     },
 
-    // AGREGAR ESTE MÉTODO AQUÍ ↓
     handleBlenderConfigUpdate(configData) {
       console.log('Configuración de Blender actualizada:', configData)
       
@@ -698,6 +697,7 @@ export default {
       // Mostrar notificación
       this.showSuccess('Configuración de Blender actualizada correctamente')
     },
+    
     showSuccess(message) {
       alert(`✅ ${message}`)
     }

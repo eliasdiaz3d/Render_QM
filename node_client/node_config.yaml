@@ -1,0 +1,11 @@
+# node_config.yaml
+master_url: "http://127.0.0.1:8000"
+node_name: "Nodo-Principal-Elias"
+blender_path: "C:\\Program Files\\Blender Foundation\\Blender 4.5\\blender.exe"
+heartbeat_interval: 15
+temp_dir: "./temp_node"
+output_dir: "./renders_node"
+gpu_enabled: true
+max_concurrent_jobs: 1
+connection_timeout: 30
+request_timeout: 60

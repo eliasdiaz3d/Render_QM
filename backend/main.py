@@ -1,7 +1,10 @@
+# -*- coding: utf-8 -*-
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
+from app.services.notification_service import notification_service
 import uvicorn
 import os
 import uuid
@@ -15,8 +18,11 @@ import platform
 import psutil
 import sys
 import re
-from datetime import datetime
-from typing import List, Optional, Dict
+import glob
+import zipfile
+from io import BytesIO
+from datetime import datetime, timedelta
+from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 from pathlib import Path
 
@@ -89,6 +95,37 @@ class BlenderConfigUpdate(BaseModel):
     timeout: int = 300
     max_memory_mb: int = 4096
     auto_detect: bool = True
+
+class NodeInfo(BaseModel):
+    node_id: str
+    node_name: str
+    status: str  # idle, busy, offline, error
+    last_seen: datetime
+    system_stats: Dict
+    active_jobs: int
+    capabilities: Dict
+    node_info: Dict
+
+class JobAssignment(BaseModel):
+    job_id: str
+    node_id: str
+    assigned_at: datetime
+    status: str
+
+class NodeRegistration(BaseModel):
+    node_id: str
+    node_name: str
+    ip_address: str
+    cpu_cores: int
+    memory_gb: float
+    platform: str
+    blender_version: Optional[str] = None
+
+class JobStatusUpdate(BaseModel):
+    status: str
+    error_message: Optional[str] = None
+    progress: int = 0
+    frames_rendered: int = 0
 
 # ==================== CONFIGURACIÓN ====================
 
@@ -245,6 +282,8 @@ def scan_for_blender() -> List[Dict]:
                         cmd, 
                         capture_output=True, 
                         text=True, 
+                        encoding="utf-8",
+                        errors="replace",
                         timeout=10,
                         creationflags=subprocess.CREATE_NO_WINDOW
                     )
@@ -321,6 +360,8 @@ def verify_blender_path(path: str) -> Dict:
                 cmd, 
                 capture_output=True, 
                 text=True, 
+                encoding="utf-8",
+                errors="replace",
                 timeout=10,
                 creationflags=subprocess.CREATE_NO_WINDOW
             )
@@ -352,7 +393,9 @@ def verify_blender_path(path: str) -> Dict:
             test_result = subprocess.run(
                 test_cmd, 
                 capture_output=True, 
-                text=True, 
+                text=True,
+                encoding="utf-8",
+                errors="replace", 
                 timeout=30,
                 creationflags=subprocess.CREATE_NO_WINDOW
             )
@@ -381,6 +424,156 @@ def verify_blender_path(path: str) -> Dict:
             "error": f"Error inesperado: {str(e)}",
             "version": None
         }
+
+def get_blend_file_info(blend_file_path: str) -> Dict[str, Any]:
+    """Extraer información del archivo .blend usando Blender"""
+    try:
+        current_blender = get_current_blender_path()
+        if not current_blender:
+            return {"error": "Blender no está configurado"}
+
+        # --- Script Python que se ejecutará dentro de Blender ---
+        python_script = r'''
+import bpy, json, os
+try:
+    scene = bpy.context.scene
+    render = scene.render
+    output_path = render.filepath
+    if output_path.startswith('//'):
+        blend_dir = os.path.dirname(bpy.data.filepath)
+        output_path = os.path.normpath(os.path.join(blend_dir, output_path[2:]))
+
+    info = {
+        "frame_start": int(scene.frame_start),
+        "frame_end": int(scene.frame_end),
+        "frame_current": int(scene.frame_current),
+        "fps": int(scene.render.fps),
+        "fps_base": float(scene.render.fps_base),
+        "render_engine": scene.render.engine,
+        "resolution_x": int(scene.render.resolution_x),
+        "resolution_y": int(scene.render.resolution_y),
+        "resolution_percentage": int(scene.render.resolution_percentage),
+        "file_format": scene.render.image_settings.file_format.lower(),
+        "samples": int(getattr(scene.cycles, "samples", 0)) if scene.render.engine == "CYCLES" else 0,
+        "scene_name": scene.name,
+        "total_frames": int((scene.frame_end - scene.frame_start) + 1),
+        "output_path": output_path,
+        "output_format": render.image_settings.file_format,
+        "color_mode": render.image_settings.color_mode,
+        "color_depth": render.image_settings.color_depth,
+        "compression": int(getattr(render.image_settings, "compression", 15)),
+        "quality": int(getattr(render.image_settings, "quality", 90)),
+    }
+    print("BLEND_INFO_START")
+    print(json.dumps(info, indent=2))
+    print("BLEND_INFO_END")
+except Exception as e:
+    print("BLEND_INFO_START")
+    print(json.dumps({"error": f"ERROR_EXTRACTING_INFO: {e}"}))
+    print("BLEND_INFO_END")
+'''
+
+        # --- Guardar script temporal y ejecutar Blender en background ---
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".py", mode="w", encoding="utf-8") as sf:
+            script_path = sf.name
+            sf.write(python_script)
+
+        print(f"🔍 Extrayendo información de: {blend_file_path}")
+
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        env.setdefault("LANG", "C.UTF-8")
+        env.setdefault("LC_ALL", "C.UTF-8")
+
+        cmd = [
+            current_blender,
+            "-b",
+            blend_file_path,
+            "--python", script_path
+        ]
+
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=180,
+            check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0,
+            env=env,
+        )
+
+        stdout = result.stdout.decode("utf-8", "replace")
+        stderr = result.stderr.decode("utf-8", "replace")
+
+        # Incluso si returncode != 0, intentamos leer el bloque JSON
+        start = stdout.find("BLEND_INFO_START")
+        end   = stdout.find("BLEND_INFO_END", start + 1)
+        if start == -1 or end == -1:
+            # si Blender falló antes de imprimir el bloque
+            if result.returncode != 0:
+                return {"error": f"Error ejecutando Blender: {stderr or stdout}"}
+            return {"error": f"No se encontraron marcadores en la salida.\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"}
+
+        payload = stdout[start + len("BLEND_INFO_START"):end].strip()
+        try:
+            data = json.loads(payload)
+        except Exception as e:
+            return {"error": f"JSON inválido desde Blender: {e}\nPayload:\n{payload}"}
+
+        # Validaciones mínimas
+        if "error" in data:
+            return data
+        fs, fe = int(data.get("frame_start", 0)), int(data.get("frame_end", 0))
+        if fs <= 0 or fe < fs:
+            return {"error": f"Rango de frames inválido: {fs}-{fe}"}
+
+        return data
+
+    except subprocess.TimeoutExpired:
+        return {"error": "Timeout ejecutando Blender para analizar el .blend"}
+    except Exception as e:
+        return {"error": f"Error analizando archivo: {e}"}
+    finally:
+        # limpiar el script temporal si existe
+        try:
+            if 'script_path' in locals() and os.path.exists(script_path):
+                os.remove(script_path)
+        except Exception:
+            pass
+
+def estimate_render_time(blend_info: Dict) -> str:
+    """Estimar tiempo de render basado en configuración"""
+    total_frames = blend_info.get("total_frames", 1)
+    samples = blend_info.get("samples", 128)
+    resolution_x = blend_info.get("resolution_x", 1920)
+    resolution_y = blend_info.get("resolution_y", 1080)
+    render_engine = blend_info.get("render_engine", "CYCLES")
+    
+    # Factores de estimación (muy aproximados)
+    base_time_per_frame = 30  # segundos base por frame
+    
+    # Ajustar según motor de render
+    if render_engine == "CYCLES":
+        base_time_per_frame *= (samples / 128)  # Factor por samples
+    elif render_engine == "EEVEE":
+        base_time_per_frame *= 0.3  # Eevee es mucho más rápido
+    elif render_engine == "WORKBENCH":
+        base_time_per_frame *= 0.1  # Workbench es muy rápido
+    
+    # Ajustar según resolución
+    resolution_factor = (resolution_x * resolution_y) / (1920 * 1080)
+    base_time_per_frame *= resolution_factor
+    
+    total_seconds = total_frames * base_time_per_frame
+    
+    if total_seconds < 60:
+        return f"~{int(total_seconds)} segundos"
+    elif total_seconds < 3600:
+        return f"~{int(total_seconds/60)} minutos"
+    else:
+        hours = int(total_seconds / 3600)
+        minutes = int((total_seconds % 3600) / 60)
+        return f"~{hours}h {minutes}m"
 
 def find_blender_executable():
     """Obtener ejecutable de Blender usando configuración"""
@@ -430,6 +623,14 @@ nodes_db = {
 # Almacén temporal para chunks
 upload_sessions: Dict[str, dict] = {}
 
+
+# ==================== BASE DE DATOS EN MEMORIA EXTENDIDA ====================
+
+# Base de datos de nodos registrados
+nodes_registry: Dict[str, NodeInfo] = {}
+
+#
+
 # ==================== FUNCIONES DE RENDER ====================
 
 async def render_job_background(job_id: str):
@@ -438,6 +639,9 @@ async def render_job_background(job_id: str):
         return
     
     job = jobs_db[job_id]
+    recipient_email = job.get("notification_email")
+    print(f"\n--- PASO 2: Iniciando Render para Job {job_id} ---")
+    print(f"📧 Intentando notificar a: '{recipient_email}'")
     
     try:
         # Actualizar estado a procesando
@@ -454,8 +658,6 @@ async def render_job_background(job_id: str):
         nodes_db["local"]["memory_usage"] = system_stats["memory_usage"]
         
         blend_file = job["file_path"]
-        output_dir = OUTPUT_DIR / job_id
-        output_dir.mkdir(exist_ok=True)
         
         # Verificar que el archivo existe
         if not os.path.exists(blend_file):
@@ -466,25 +668,57 @@ async def render_job_background(job_id: str):
         if not current_blender:
             raise Exception("Blender no está configurado o no se encuentra")
         
-        # Configurar comando de Blender para animación
-        output_pattern = str(output_dir / "frame_####")
+        # Obtener información del archivo .blend para usar su configuración
+        blend_info = get_blend_file_info(blend_file)
+        
         frame_start = job.get("frame_start", 1)
         frame_end = job.get("frame_end", 1)
         total_frames = (frame_end - frame_start) + 1
         
+        # Decidir dónde guardar los renders
+        use_blend_output = blend_info and "output_path" in blend_info and blend_info["output_path"]
+        
+        if use_blend_output:
+            # Usar la configuración de output del archivo .blend
+            print(f"📁 Usando output configurado en .blend: {blend_info['output_path']}")
+            
+            # El comando de Blender usará la configuración interna del archivo
+            # No necesitamos especificar -o ya que usará la configuración del .blend
+            cmd = [
+                current_blender,
+                "-b",  # Background mode
+                blend_file,
+                "-s", str(frame_start),  # Frame inicial
+                "-e", str(frame_end),    # Frame final
+                "-a"  # Render animación completa
+            ]
+            
+            # Determinar directorio de output para seguimiento
+            output_dir = Path(blend_info["output_path"]).parent
+            if not output_dir.exists():
+                output_dir.mkdir(parents=True, exist_ok=True)
+            
+        else:
+            # Fallback: usar nuestro directorio por defecto
+            output_dir = OUTPUT_DIR / job_id
+            output_dir.mkdir(exist_ok=True)
+            output_pattern = str(output_dir / "frame_####")
+            
+            print(f"📁 Usando output por defecto: {output_pattern}")
+            
+            cmd = [
+                current_blender,
+                "-b",  # Background mode
+                blend_file,
+                "-o", output_pattern,
+                "-s", str(frame_start),  # Frame inicial
+                "-e", str(frame_end),    # Frame final
+                "-a"  # Render animación completa
+            ]
+        
+        job["output_path"] = str(output_dir)
+        
         print(f"🎬 Renderizando animación: frames {frame_start}-{frame_end} ({total_frames} frames)")
-        
-        # Comando para renderizar animación completa
-        cmd = [
-            current_blender,
-            "-b",  # Background mode
-            blend_file,
-            "-o", output_pattern,
-            "-s", str(frame_start),  # Frame inicial
-            "-e", str(frame_end),    # Frame final
-            "-a"  # Render animación completa
-        ]
-        
         print(f"🎬 Ejecutando comando: {' '.join(cmd)}")
         
         # Ejecutar Blender
@@ -508,87 +742,593 @@ async def render_job_background(job_id: str):
         
         # Monitorear progreso en tiempo real
         frames_completed = 0
+        last_saved_frame = None
         
         # Leer salida de Blender para obtener progreso real
         while True:
             # Verificar si fue cancelado
             if job["status"] == "cancelled":
                 process.terminate()
+                print(f"🛑 Render cancelado por el usuario: {job_id}")
                 return
             
             # Leer una línea de output
             output_line = process.stdout.readline()
             
             if output_line:
-                print(f"Blender output: {output_line.strip()}")
+                line = output_line.strip()
+                print(f"Blender output: {line}")
                 
-                # Buscar indicadores de progreso de frame
-                if "Saved:" in output_line or "Time:" in output_line:
-                    frames_completed += 1
-                    job["frames_rendered"] = frames_completed
-                    progress = min(int((frames_completed / total_frames) * 100), 99)
-                    job["progress"] = progress
-                    
-                    print(f"📈 Progreso: Frame {frames_completed}/{total_frames} ({progress}%)")
+                # Detectar cuando un frame se ha guardado exitosamente
+                if "Saved:" in line:
+                    # Extraer información del archivo guardado
+                    saved_file_match = re.search(r"'([^']+)'", line)
+                    if saved_file_match:
+                        saved_file_path = saved_file_match.group(1)
+                        print(f"📁 Archivo guardado: {saved_file_path}")
+                        
+                        # Extraer número de frame del nombre del archivo
+                        frame_match = re.search(r'(\d+)\.(?:png|jpg|jpeg|exr|tiff)', saved_file_path, re.IGNORECASE)
+                        if frame_match:
+                            saved_frame = int(frame_match.group(1))
+                            
+                            # Solo contar si es un frame nuevo
+                            if last_saved_frame is None or saved_frame != last_saved_frame:
+                                frames_completed += 1
+                                last_saved_frame = saved_frame
+                                job["frames_rendered"] = frames_completed
+                                
+                                # Calcular progreso basado en frames realmente guardados
+                                progress = min(int((frames_completed / total_frames) * 100), 99)
+                                job["progress"] = progress
+                                
+                                print(f"📈 Progreso REAL: Frame {frames_completed}/{total_frames} ({progress}%) - Guardado: {os.path.basename(saved_file_path)}")
                 
-                # Detectar errores
-                if "Error:" in output_line or "EXCEPTION" in output_line:
-                    print(f"❌ Error detectado en Blender: {output_line.strip()}")
+                # Detectar errores críticos
+                if "Error:" in line or "EXCEPTION" in line or "Traceback" in line:
+                    print(f"❌ Error crítico detectado: {line}")
             
             # Verificar si el proceso terminó
             if process.poll() is not None:
                 break
             
-            # Pequeña pausa para no sobrecargar
+            # Pequeña pausa para no sobrecargar CPU
             await asyncio.sleep(0.1)
         
         # Obtener salida final
         stdout, stderr = process.communicate()
         
         if process.returncode == 0:
-            # Verificar que se renderizaron los frames
-            rendered_files = list(output_dir.glob("frame_*.png")) + list(output_dir.glob("frame_*.jpg")) + list(output_dir.glob("frame_*.exr"))
-            actual_frames = len(rendered_files)
-            
-            # Éxito
             job["status"] = "completed"
-            job["progress"] = 100
-            job["frames_rendered"] = actual_frames
             job["completed_at"] = datetime.now()
-            job["output_path"] = str(output_dir)
-            
-            # Actualizar estadísticas
-            duration = job["completed_at"] - job["started_at"]
-            job["render_time"] = str(duration).split('.')[0]  # Sin microsegundos
-            
-            print(f"✅ Render completado para job {job_id}")
-            print(f"📊 Frames renderizados: {actual_frames}/{total_frames}")
-            print(f"⏱️ Tiempo total: {job['render_time']}")
-            
+            print(f"✅ Render COMPLETADO exitosamente para job {job_id}")
+
+            print(f"\n--- PASO 3: Finalización de Job (Éxito) ---")
+            if recipient_email:
+                print(f"📧 Llamando al servicio de notificación para {recipient_email}...")
+                await notification_service.notify_job_completed(
+                    job_name=job["name"],
+                    output_path=str(job["output_path"]),
+                    recipient=recipient_email
+                )
+            else:
+                print("🤷‍♂️ No hay email de notificación configurado para este job.")
         else:
-            # Error
             job["status"] = "failed"
-            job["error_message"] = f"Blender error (code {process.returncode}): {stderr}"
-            print(f"❌ Error en render: {stderr}")
-    
-    except subprocess.TimeoutExpired:
-        job["status"] = "failed"
-        job["error_message"] = "Timeout: El render tardó demasiado tiempo"
-        if 'process' in locals():
-            process.kill()
-    
+            error_msg = f"Blender terminó con error (código {process.returncode}): {stderr[:500]}"
+            job["error_message"] = error_msg
+            print(f"❌ Error en render: código {process.returncode}")
+
+            print(f"\n--- PASO 3: Finalización de Job (Fallo) ---")
+            if recipient_email:
+                print(f"📧 Llamando al servicio de notificación para {recipient_email}...")
+                await notification_service.notify_job_failed(
+                    job_name=job["name"],
+                    error_message=error_msg,
+                    recipient=recipient_email
+                )
+            else:
+                print("🤷‍♂️ No hay email de notificación configurado para este job.")
+
     except Exception as e:
         job["status"] = "failed"
         job["error_message"] = str(e)
         print(f"❌ Error en render: {e}")
+
+        print(f"\n--- PASO 3: Finalización de Job (Excepción) ---")
+        if recipient_email:
+            print(f"📧 Llamando al servicio de notificación para {recipient_email}...")
+            await notification_service.notify_job_failed(
+                job_name=job.get("name", "Desconocido"),
+                error_message=str(e),
+                recipient=recipient_email
+            )
+        else:
+            print("🤷‍♂️ No hay email de notificación configurado para este job.")
     
     finally:
-        # Liberar nodo con estadísticas actualizadas
         system_stats = get_system_stats()
         nodes_db["local"]["status"] = "online"
         nodes_db["local"]["current_job"] = None
         nodes_db["local"]["cpu_usage"] = system_stats["cpu_usage"]
         nodes_db["local"]["memory_usage"] = system_stats["memory_usage"]
+
+# ==================== ENDPOINTS PRINCIPALES ====================
+
+@app.post("/api/v1/blend/analyze")
+async def analyze_blend_file(file: UploadFile = File(...)):
+    """Analizar archivo .blend y extraer información de frames"""
+    
+    if not file.filename.endswith('.blend'):
+        raise HTTPException(status_code=400, detail="Solo se permiten archivos .blend")
+    
+    # Guardar archivo temporal
+    temp_file_path = TEMP_DIR / f"temp_{uuid.uuid4()}_{file.filename}"
+    
+    try:
+        # Guardar archivo
+        with open(temp_file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        # Extraer información
+        blend_info = get_blend_file_info(str(temp_file_path))
+        
+        if "error" in blend_info:
+            raise HTTPException(status_code=400, detail=blend_info["error"])
+        
+        return {
+            "filename": file.filename,
+            "file_size": temp_file_path.stat().st_size,
+            "blend_info": blend_info,
+            "recommended_settings": {
+                "frame_start": blend_info["frame_start"],
+                "frame_end": blend_info["frame_end"],
+                "render_engine": blend_info["render_engine"],
+                "total_frames": blend_info["total_frames"],
+                "estimated_time": estimate_render_time(blend_info)
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error analizando archivo: {str(e)}")
+    finally:
+        # Limpiar archivo temporal
+        if temp_file_path.exists():
+            os.remove(temp_file_path)
+
+@app.get("/api/v1/jobs/{job_id}/download-result")
+async def download_job_result(job_id: str, frame: Optional[int] = None):
+    """Descargar resultado del render - frame específico o primer frame (usado por navegador)"""
+    if job_id not in jobs_db:
+        raise HTTPException(status_code=404, detail="Trabajo no encontrado")
+    
+    job = jobs_db[job_id]
+    
+    if job["status"] != "completed":
+        raise HTTPException(status_code=400, detail="El trabajo no está completado")
+    
+    # Buscar archivos de imagen en directorios posibles
+    possible_dirs = []
+    if job.get("output_path"):
+        possible_dirs.append(Path(job["output_path"]))
+    possible_dirs.append(OUTPUT_DIR / job_id)
+    
+    image_files = []
+    for output_dir in possible_dirs:
+        if output_dir.exists():
+            extensions = ["*.png", "*.jpg", "*.jpeg", "*.exr", "*.tiff"]
+            for ext in extensions:
+                image_files.extend(list(output_dir.glob(ext)))
+                image_files.extend(list(output_dir.glob(f"**/{ext}")))
+    
+    image_files = sorted(image_files)
+    
+    if not image_files:
+        raise HTTPException(status_code=404, detail="No se encontraron imágenes renderizadas")
+    
+    # Si se especifica un frame, buscar ese frame específico
+    if frame is not None:
+        target_file = None
+        for img_file in image_files:
+            if f"{frame:04d}" in img_file.name:
+                target_file = img_file
+                break
+        
+        if not target_file:
+            raise HTTPException(status_code=404, detail=f"Frame {frame} no encontrado")
+        
+        return FileResponse(path=target_file, filename=target_file.name)
+    
+    # Devolver primer frame por defecto
+    first_file = image_files[0]
+    return FileResponse(path=first_file, filename=first_file.name)
+
+@app.post("/api/v1/jobs/{job_id}/upload-result")
+async def upload_job_result(job_id: str, file: UploadFile = File(...)):
+    """Subir resultado de render desde nodo"""
+    try:
+        if job_id not in jobs_db:
+            raise HTTPException(status_code=404, detail="Trabajo no encontrado")
+        
+        # Crear directorio de salida para el trabajo
+        job_output_dir = OUTPUT_DIR / job_id
+        job_output_dir.mkdir(exist_ok=True)
+        
+        # Guardar archivo resultado
+        file_path = job_output_dir / file.filename
+        
+        with open(file_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+        
+        # Actualizar información del trabajo
+        if "output_files" not in jobs_db[job_id]:
+            jobs_db[job_id]["output_files"] = []
+        
+        jobs_db[job_id]["output_files"].append({
+            "filename": file.filename,
+            "path": str(file_path),
+            "size": len(content),
+            "uploaded_at": datetime.now().isoformat()
+        })
+        
+        print(f"📁 Archivo resultado recibido para trabajo {job_id}: {file.filename}")
+        
+        return {
+            "message": "Archivo resultado subido exitosamente",
+            "filename": file.filename,
+            "size": len(content)
+        }
+        
+    except Exception as e:
+        print(f"Error subiendo resultado para trabajo {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error subiendo resultado: {str(e)}")
+
+@app.get("/api/v1/jobs/{job_id}/download")
+async def download_job_file(job_id: str, format: str = "zip"):
+    """Permite descargar archivos - ZIP para nodos, imagen para frontend"""
+    if job_id not in jobs_db:
+        raise HTTPException(status_code=404, detail="Trabajo no encontrado")
+    
+    job = jobs_db[job_id]
+    
+    # Si format=zip o es un nodo, devolver ZIP del .blend
+    if format == "zip":
+        file_path = Path(job["file_path"])
+        
+        if not file_path.exists():
+            raise HTTPException(status_code=404, detail="Archivo no encontrado")
+        
+        # Crear ZIP en memoria con el archivo .blend
+        zip_buffer = BytesIO()
+        
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            zip_file.write(file_path, file_path.name)
+        
+        zip_buffer.seek(0)
+        
+        return StreamingResponse(
+            BytesIO(zip_buffer.read()),
+            media_type="application/zip",
+            headers={"Content-Disposition": f"attachment; filename={job_id}.zip"}
+        )
+    
+    # Si format=image o es el frontend, devolver primera imagen renderizada
+    if job["status"] != "completed":
+        raise HTTPException(status_code=400, detail="El trabajo no está completado")
+    
+    if not job["output_path"]:
+        raise HTTPException(status_code=404, detail="No se encontró directorio de salida")
+    
+    # Buscar archivos de imagen
+    output_dir = Path(job["output_path"])
+    common_extensions = ["*.png", "*.jpg", "*.jpeg", "*.exr", "*.tiff", "*.tif"]
+    image_files = []
+    
+    for ext in common_extensions:
+        image_files.extend(list(output_dir.glob(ext)))
+        image_files.extend(list(output_dir.glob("**/" + ext)))
+    
+    image_files = sorted(image_files)
+    
+    if not image_files:
+        raise HTTPException(status_code=404, detail="No se encontraron imágenes renderizadas")
+    
+    # Devolver primer frame
+    first_file = image_files[0]
+    
+    # Determinar tipo MIME
+    mime_type = "image/png"
+    if first_file.suffix.lower() in ['.jpg', '.jpeg']:
+        mime_type = "image/jpeg"
+    elif first_file.suffix.lower() == '.exr':
+        mime_type = "image/x-exr"
+    elif first_file.suffix.lower() in ['.tiff', '.tif']:
+        mime_type = "image/tiff"
+    
+    return FileResponse(
+        path=str(first_file),
+        filename=f"preview_{job_id}{first_file.suffix}",
+        media_type=mime_type
+    )
+
+# Endpoint adicional para limpiar nodos offline
+@app.post("/api/v1/nodes/cleanup")
+async def cleanup_offline_nodes():
+    """Limpiar nodos que no han enviado heartbeat recientemente"""
+    try:
+        current_time = datetime.now()
+        offline_threshold = timedelta(minutes=2)  # 2 minutos sin heartbeat = offline
+        
+        offline_nodes = []
+        
+        for node_id, node_info in list(nodes_db.items()):
+            last_seen = node_info.get("last_seen")
+            if isinstance(last_seen, str):
+                last_seen = datetime.fromisoformat(last_seen.replace('Z', '+00:00'))
+            
+            if last_seen and (current_time - last_seen) > offline_threshold:
+                offline_nodes.append(node_id)
+                
+                # Marcar trabajos asignados como pendientes
+                for job_id, job in jobs_db.items():
+                    if job.get("assigned_node") == node_id and job["status"] == "processing":
+                        jobs_db[job_id]["status"] = "pending"
+                        jobs_db[job_id]["assigned_node"] = None
+                        print(f"🔄 Trabajo {job_id} marcado como pendiente (nodo offline)")
+                
+                # Eliminar nodo
+                del nodes_db[node_id]
+                print(f"🗑️ Nodo offline eliminado: {node_id}")
+        
+        return {
+            "message": f"Limpieza completada. {len(offline_nodes)} nodos eliminados",
+            "offline_nodes": offline_nodes
+        }
+        
+    except Exception as e:
+        print(f"Error limpiando nodos offline: {e}")
+        raise HTTPException(status_code=500, detail=f"Error en limpieza: {str(e)}")
+
+# Endpoint para obtener estadísticas detalladas de nodos
+@app.get("/api/v1/nodes/stats")
+async def get_nodes_statistics():
+    """Obtener estadísticas detalladas de todos los nodos"""
+    try:
+        current_time = datetime.now()
+        
+        stats = {
+            "total_nodes": len(nodes_db),
+            "online_nodes": 0,
+            "offline_nodes": 0,
+            "rendering_nodes": 0,
+            "idle_nodes": 0,
+            "total_cpu_cores": 0,
+            "total_memory_gb": 0,
+            "total_active_jobs": 0,
+            "nodes_detail": []
+        }
+        
+        for node_id, node_info in nodes_db.items():
+            last_seen = node_info.get("last_seen")
+            if isinstance(last_seen, str):
+                try:
+                    last_seen = datetime.fromisoformat(last_seen.replace('Z', '+00:00'))
+                except:
+                    last_seen = datetime.now() - timedelta(hours=1)  # Asumir offline
+            
+            # Determinar estado
+            if last_seen and (current_time - last_seen) < timedelta(minutes=2):
+                if node_info.get("status") == "rendering":
+                    stats["rendering_nodes"] += 1
+                    node_status = "rendering"
+                else:
+                    stats["idle_nodes"] += 1
+                    node_status = "idle"
+                stats["online_nodes"] += 1
+            else:
+                stats["offline_nodes"] += 1
+                node_status = "offline"
+            
+            # Sumar recursos
+            system_stats = node_info.get("system_stats", {})
+            stats["total_cpu_cores"] += system_stats.get("cpu_count", 0)
+            stats["total_memory_gb"] += system_stats.get("memory_total_gb", 0)
+            stats["total_active_jobs"] += node_info.get("active_jobs", 0)
+            
+            # Detalle del nodo
+            stats["nodes_detail"].append({
+                "id": node_id,
+                "name": node_info.get("name", "Sin nombre"),
+                "status": node_status,
+                "last_seen": last_seen.isoformat() if last_seen else None,
+                "active_jobs": node_info.get("active_jobs", 0),
+                "cpu_usage": system_stats.get("cpu_percent", 0),
+                "memory_usage": system_stats.get("memory_percent", 0),
+                "capabilities": node_info.get("capabilities", {}),
+                "system_info": node_info.get("node_info", {})
+            })
+        
+        return stats
+        
+    except Exception as e:
+        print(f"Error obteniendo estadísticas de nodos: {e}")
+        raise HTTPException(status_code=500, detail=f"Error obteniendo estadísticas: {str(e)}")
+    
+@app.get("/api/v1/jobs/{job_id}/frames")
+async def get_job_frames(job_id: str):
+    """Obtener lista de todos los frames renderizados"""
+    if job_id not in jobs_db:
+        raise HTTPException(status_code=404, detail="Trabajo no encontrado")
+    
+    job = jobs_db[job_id]
+    
+    if job["status"] != "completed":
+        return {
+            "has_frames": False,
+            "status": job["status"],
+            "message": f"Trabajo en estado: {job['status']}"
+        }
+    
+    if not job["output_path"]:
+        return {
+            "has_frames": False,
+            "message": "No se encontró directorio de salida"
+        }
+    
+    # Buscar archivos de imagen con múltiples extensiones
+    output_dir = Path(job["output_path"])
+    common_extensions = ["*.png", "*.jpg", "*.jpeg", "*.exr", "*.tiff", "*.tif"]
+    image_files = []
+    
+    for ext in common_extensions:
+        image_files.extend(list(output_dir.glob(ext)))
+        image_files.extend(list(output_dir.glob("**/" + ext)))
+    
+    image_files = sorted(image_files)
+    
+    if not image_files:
+        return {
+            "has_frames": False,
+            "message": "No se encontraron imágenes renderizadas"
+        }
+    
+    # Extraer números de frame
+    frames = []
+    for img_file in image_files:
+        try:
+            # Extraer número de frame del nombre del archivo
+            frame_matches = re.findall(r'(\d+)', img_file.stem)
+            if frame_matches:
+                frame_num = max(frame_matches, key=len)
+                frame_num = int(frame_num)
+                
+                # CORRECCIÓN: Usar rutas que sirvan los archivos correctamente
+                frames.append({
+                    "frame_number": frame_num,
+                    "filename": img_file.name,
+                    "file_size": img_file.stat().st_size,
+                    "download_url": f"/api/v1/jobs/{job_id}/frame/{frame_num}",
+                    "static_url": f"/renders/{job_id}/{img_file.name}",  # Ruta estática
+                    "full_path": str(img_file)
+                })
+        except:
+            continue
+    
+    frames.sort(key=lambda x: x["frame_number"])
+    
+    return {
+        "has_frames": True,
+        "total_frames": len(frames),
+        "frame_start": job.get("frame_start", 1),
+        "frame_end": job.get("frame_end", 1),
+        "frames": frames,
+        "output_dir": str(output_dir),
+        "preview_url": f"/api/v1/jobs/{job_id}/download-first-frame"
+    }
+
+@app.get("/api/v1/jobs/{job_id}/frame/{frame_num}")
+async def get_specific_frame(job_id: str, frame_num: int):
+    """Obtener un frame específico"""
+    if job_id not in jobs_db:
+        raise HTTPException(status_code=404, detail="Trabajo no encontrado")
+    
+    job = jobs_db[job_id]
+    
+    if job["status"] != "completed":
+        raise HTTPException(status_code=400, detail="El trabajo no está completado")
+    
+    if not job["output_path"]:
+        raise HTTPException(status_code=404, detail="No se encontró directorio de salida")
+    
+    # Buscar archivos de imagen
+    output_dir = Path(job["output_path"])
+    common_extensions = ["*.png", "*.jpg", "*.jpeg", "*.exr", "*.tiff", "*.tif"]
+    image_files = []
+    
+    for ext in common_extensions:
+        image_files.extend(list(output_dir.glob(ext)))
+        image_files.extend(list(output_dir.glob("**/" + ext)))
+    
+    # Buscar el frame específico
+    frame_file = None
+    for img_file in image_files:
+        # Buscar diferentes patrones de numeración
+        frame_patterns = [
+            f'{frame_num:04d}',  # 0001
+            f'{frame_num:03d}',  # 001
+            f'{frame_num:02d}',  # 01
+            f'{frame_num}',      # 1
+        ]
+        
+        for pattern in frame_patterns:
+            if pattern in img_file.name:
+                frame_file = img_file
+                break
+        if frame_file:
+            break
+    
+    if not frame_file:
+        raise HTTPException(status_code=404, detail=f"Frame {frame_num} no encontrado")
+    
+    # Determinar tipo MIME
+    mime_type = "image/png"
+    if frame_file.suffix.lower() in ['.jpg', '.jpeg']:
+        mime_type = "image/jpeg"
+    elif frame_file.suffix.lower() == '.exr':
+        mime_type = "image/x-exr"
+    elif frame_file.suffix.lower() in ['.tiff', '.tif']:
+        mime_type = "image/tiff"
+    
+    return FileResponse(
+        path=str(frame_file),
+        filename=f"frame_{frame_num:04d}{frame_file.suffix}",
+        media_type=mime_type
+    )
+
+@app.get("/api/v1/jobs/{job_id}/download-all")
+async def download_all_frames(job_id: str):
+    """Descargar todos los frames como ZIP"""
+    if job_id not in jobs_db:
+        raise HTTPException(status_code=404, detail="Trabajo no encontrado")
+    
+    job = jobs_db[job_id]
+    
+    if job["status"] != "completed":
+        raise HTTPException(status_code=400, detail="El trabajo no está completado")
+    
+    if not job["output_path"]:
+        raise HTTPException(status_code=404, detail="No se encontró resultado")
+    
+    # Buscar archivos de imagen
+    output_dir = Path(job["output_path"])
+    common_extensions = ["*.png", "*.jpg", "*.jpeg", "*.exr", "*.tiff", "*.tif"]
+    image_files = []
+    
+    for ext in common_extensions:
+        image_files.extend(list(output_dir.glob(ext)))
+        image_files.extend(list(output_dir.glob("**/" + ext)))
+    
+    if not image_files:
+        raise HTTPException(status_code=404, detail="No se encontraron imágenes renderizadas")
+    
+    # Crear ZIP en memoria
+    zip_buffer = BytesIO()
+    
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        for img_file in sorted(image_files):
+            # Usar path relativo al directorio de output para evitar paths absolutos en el ZIP
+            arcname = os.path.relpath(str(img_file), str(output_dir))
+            zip_file.write(img_file, arcname)
+    
+    zip_buffer.seek(0)
+    
+    # Devolver ZIP como respuesta
+    return StreamingResponse(
+        BytesIO(zip_buffer.read()),
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename=render_{job_id}_all_frames.zip"}
+    )
 
 # ==================== ENDPOINTS FALTANTES ====================
 
@@ -668,6 +1408,53 @@ async def get_system_info():
         print(f"Error getting system info: {e}")
         raise HTTPException(status_code=500, detail=f"Error getting system information: {str(e)}")
 
+@app.get("/api/v1/jobs/{job_id}/download-first-frame")
+async def download_first_frame(job_id: str):
+    """Descargar primer frame para preview"""
+    if job_id not in jobs_db:
+        raise HTTPException(status_code=404, detail="Trabajo no encontrado")
+    
+    job = jobs_db[job_id]
+    
+    if job["status"] != "completed":
+        raise HTTPException(status_code=400, detail="El trabajo no está completado")
+    
+    if not job["output_path"]:
+        raise HTTPException(status_code=404, detail="No se encontró directorio de salida")
+    
+    # Buscar archivos de imagen
+    output_dir = Path(job["output_path"])
+    common_extensions = ["*.png", "*.jpg", "*.jpeg", "*.exr", "*.tiff", "*.tif"]
+    image_files = []
+    
+    for ext in common_extensions:
+        image_files.extend(list(output_dir.glob(ext)))
+        image_files.extend(list(output_dir.glob("**/" + ext)))
+    
+    image_files = sorted(image_files)
+    
+    if not image_files:
+        raise HTTPException(status_code=404, detail="No se encontraron imágenes renderizadas")
+    
+    # Devolver primer frame
+    first_file = image_files[0]
+    
+    # Determinar tipo MIME
+    mime_type = "image/png"
+    if first_file.suffix.lower() in ['.jpg', '.jpeg']:
+        mime_type = "image/jpeg"
+    elif first_file.suffix.lower() == '.exr':
+        mime_type = "image/x-exr"
+    elif first_file.suffix.lower() in ['.tiff', '.tif']:
+        mime_type = "image/tiff"
+    
+    return FileResponse(
+        path=str(first_file),
+        filename=f"preview_{job_id}{first_file.suffix}",
+        media_type=mime_type
+    )
+
+
 @app.post("/api/v1/config/blender/test")
 async def test_blender_config(request: BlenderTestRequest):
     """Prueba la configuración de Blender sin guardarla"""
@@ -690,7 +1477,7 @@ async def test_blender_config(request: BlenderTestRequest):
 
 @app.post("/api/v1/config/blender/auto-detect")
 async def auto_detect_blender():
-    """Auto-detecta instalaciones de Blender en el sistema"""
+    """Auto-detecta instalaciones de Blender, recomienda la más reciente y devuelve la lista completa."""
     try:
         detected_versions = scan_for_blender()
         
@@ -705,31 +1492,40 @@ async def auto_detect_blender():
                 }
             }
         
-        # Si solo hay una versión válida, devolverla como seleccionada
-        valid_versions = [v for v in detected_versions if v.get("valid", False)]
+        # Filtrar solo versiones que son válidas y tienen un número de versión parseable
+        valid_versions = [
+            v for v in detected_versions 
+            if v.get("valid", False) and re.match(r'^\d+\.\d+\.\d+', v.get("version", ""))
+        ]
         
-        if len(valid_versions) == 1:
-            selected = valid_versions[0]
-            return {
-                "detected_versions": detected_versions,
-                "blender_path": selected["path"],
-                "verification": {
-                    "valid": True,
-                    "version": selected["version"],
-                    "error": None
-                }
-            }
-        else:
-            # Múltiples versiones o ninguna válida
+        if not valid_versions:
             return {
                 "detected_versions": detected_versions,
                 "blender_path": None,
                 "verification": {
                     "valid": False,
-                    "error": f"Se encontraron {len(valid_versions)} versiones válidas" if valid_versions else "No se encontraron versiones válidas",
+                    "error": "No se encontraron versiones válidas de Blender",
                     "version": None
                 }
             }
+        
+        # Encontrar la versión más reciente comparando los números de versión
+        # Convierte "4.5.2" a una tupla (4, 5, 2) para una comparación precisa
+        most_recent_version = max(
+            valid_versions, 
+            key=lambda v: tuple(map(int, v['version'].split('.')))
+        )
+        
+        return {
+            "detected_versions": detected_versions,
+            "blender_path": most_recent_version["path"],
+            "verification": {
+                "valid": True,
+                "version": most_recent_version["version"],
+                "error": None,
+                "message": f"Se recomienda la versión más reciente. Se encontraron {len(valid_versions)} versiones válidas."
+            }
+        }
             
     except Exception as e:
         print(f"Error auto-detecting Blender: {e}")
@@ -771,6 +1567,135 @@ async def save_blender_config(config: BlenderConfigUpdate):
     except Exception as e:
         print(f"Error saving Blender config: {e}")
         raise HTTPException(status_code=500, detail=f"Error saving Blender configuration: {str(e)}")
+
+# ==================== ENDPOINTS DE NODOS DISTRIBUIDOS ====================
+
+@app.post("/api/v1/nodes/{node_id}/heartbeat")
+async def node_heartbeat_by_id(node_id: str, heartbeat_data: Dict[str, Any]):
+    """Recibe heartbeat de un nodo específico"""
+    try:
+        if node_id not in nodes_db:
+            raise HTTPException(
+                status_code=404, 
+                detail="Nodo no registrado. Por favor, regístrese de nuevo."
+            )
+        
+        # Actualizar información del nodo
+        nodes_db[node_id]["last_seen"] = datetime.now()
+        nodes_db[node_id]["status"] = heartbeat_data.get("status", "online")
+        
+        # Actualizar estadísticas del sistema
+        if "system_stats" in heartbeat_data:
+            nodes_db[node_id]["system_stats"] = heartbeat_data["system_stats"]
+        
+        # Actualizar trabajos activos
+        if "job_statuses" in heartbeat_data:
+            job_statuses = heartbeat_data["job_statuses"]
+            for job_id, job_status in job_statuses.items():
+                if job_id in jobs_db:
+                    # Actualizar estado del trabajo
+                    jobs_db[job_id]["status"] = job_status.get("status", "processing")
+                    jobs_db[job_id]["progress"] = job_status.get("progress", 0)
+                    jobs_db[job_id]["frame_current"] = job_status.get("frame_current", 0)
+                    jobs_db[job_id]["frame_total"] = job_status.get("frame_total", 0)
+                    
+                    # Si se completó, manejar finalización
+                    if job_status.get("status") == "completed":
+                        jobs_db[job_id]["status"] = "completed"
+                        jobs_db[job_id]["completed_at"] = datetime.now()
+                        jobs_db[job_id]["progress"] = 100
+                        
+                        # Actualizar contador del nodo
+                        if "active_jobs" in nodes_db[node_id]:
+                            nodes_db[node_id]["active_jobs"] = max(0, nodes_db[node_id]["active_jobs"] - 1)
+                        
+                        print(f"✅ Trabajo {job_id} completado por nodo {node_id}")
+                    
+                    elif job_status.get("status") == "failed":
+                        jobs_db[job_id]["status"] = "failed"
+                        jobs_db[job_id]["error_message"] = job_status.get("error_message", "Error desconocido")
+                        jobs_db[job_id]["completed_at"] = datetime.now()
+                        
+                        # Actualizar contador del nodo
+                        if "active_jobs" in nodes_db[node_id]:
+                            nodes_db[node_id]["active_jobs"] = max(0, nodes_db[node_id]["active_jobs"] - 1)
+                        
+                        print(f"❌ Trabajo {job_id} falló en nodo {node_id}: {job_status.get('error_message', 'Error desconocido')}")
+        
+        return {
+            "message": "Heartbeat recibido",
+            "server_time": datetime.now().isoformat(),
+            "next_heartbeat": (datetime.now() + timedelta(seconds=15)).isoformat()
+        }
+        
+    except Exception as e:
+        print(f"Error procesando heartbeat de nodo {node_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error procesando heartbeat: {str(e)}")
+
+@app.get("/api/v1/nodes/{node_id}/poll")
+async def poll_job_for_node(node_id: str):
+    """Consultar si hay trabajos disponibles para un nodo específico"""
+    try:
+        if node_id not in nodes_db:
+            raise HTTPException(
+                status_code=404, 
+                detail="Nodo no registrado"
+            )
+        
+        node_info = nodes_db[node_id]
+        
+        # Verificar si el nodo puede tomar más trabajos
+        max_jobs = node_info.get("capabilities", {}).get("max_concurrent_jobs", 1)
+        current_jobs = node_info.get("active_jobs", 0)
+        
+        if current_jobs >= max_jobs:
+            # Nodo ocupado - devolver 204 No Content
+            return Response(status_code=204)
+        
+        # Buscar trabajos pendientes
+        pending_jobs = [
+            job for job in jobs_db.values() 
+            if job["status"] == "pending"
+        ]
+        
+        if not pending_jobs:
+            # No hay trabajos disponibles - devolver 204 No Content
+            return Response(status_code=204)
+        
+        # Obtener el primer trabajo pendiente
+        job = pending_jobs[0]
+        job_id = job["id"]
+        
+        # Asignar trabajo al nodo
+        jobs_db[job_id]["status"] = "processing"
+        jobs_db[job_id]["started_at"] = datetime.now()
+        jobs_db[job_id]["assigned_node"] = node_id
+        
+        # Actualizar contador de trabajos activos del nodo
+        if "active_jobs" not in nodes_db[node_id]:
+            nodes_db[node_id]["active_jobs"] = 0
+        nodes_db[node_id]["active_jobs"] += 1
+        nodes_db[node_id]["status"] = "rendering"
+        
+        print(f"🎬 Trabajo {job_id} asignado a nodo {node_id} ({node_info.get('name', 'Sin nombre')})")
+        
+        # Preparar datos del trabajo para el nodo
+        job_data = {
+            "job_id": job_id,
+            "name": job["name"],
+            "start_frame": job.get("frame_start", 1),
+            "end_frame": job.get("frame_end", 1),
+            "output_format": job.get("output_format", "PNG"),
+            "engine": job.get("engine", "CYCLES"),
+            "samples": job.get("samples", 128),
+            "created_at": job["created_at"].isoformat() if isinstance(job["created_at"], datetime) else str(job["created_at"])
+        }
+        
+        return job_data
+        
+    except Exception as e:
+        print(f"Error polling trabajo para nodo {node_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error consultando trabajo: {str(e)}")
 
 # ==================== RUTAS PRINCIPALES ====================
 
@@ -918,64 +1843,27 @@ async def reset_blender_config():
 # ==================== RUTAS DE UPLOAD ====================
 
 @app.post("/api/v1/jobs/upload")
-async def upload_and_create_job(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-    name: str = Form(...),
-    frame_start: int = Form(1),
-    frame_end: int = Form(1),
-    render_engine: str = Form("CYCLES")
-):
-    """Subir archivo .blend y crear trabajo de render"""
-    
-    # Validar archivo
+async def upload_and_create_job(file: UploadFile = File(...), name: str = Form(...), frame_start: int = Form(1), frame_end: int = Form(1), notification_email: Optional[str] = Form(None)):
     if not file.filename.endswith('.blend'):
         raise HTTPException(status_code=400, detail="Solo se permiten archivos .blend")
     
-    # Generar ID único
     job_id = str(uuid.uuid4())
-    
-    # Guardar archivo
     file_path = UPLOAD_DIR / f"{job_id}_{file.filename}"
     
-    try:
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al guardar archivo: {e}")
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
     
-    # Crear trabajo en la base de datos
     job = {
-        "id": job_id,
-        "name": name,
-        "status": "pending",
-        "progress": 0,
-        "created_at": datetime.now(),
-        "started_at": None,
-        "completed_at": None,
-        "file_path": str(file_path),
-        "original_filename": file.filename,
-        "output_path": None,
-        "frame_start": frame_start,
-        "frame_end": frame_end,
-        "frames_total": (frame_end - frame_start) + 1,
-        "frames_rendered": 0,
-        "render_engine": render_engine,
-        "estimated_time": None,
-        "error_message": None,
-        "file_size": file.size if hasattr(file, 'size') else 0
+        "id": job_id, "name": name, "status": "pending", "progress": 0,
+        "created_at": datetime.now(), "started_at": None, "completed_at": None,
+        "file_path": str(file_path), "original_filename": file.filename,
+        "output_path": str(OUTPUT_DIR / job_id), "frame_start": frame_start, "frame_end": frame_end,
+        "frames_total": (frame_end - frame_start) + 1, "frames_rendered": 0,
+        "notification_email": notification_email
     }
     
     jobs_db[job_id] = job
-    
-    # Iniciar render en background
-    background_tasks.add_task(render_job_background, job_id)
-    
-    return {
-        "message": "Archivo subido y trabajo creado exitosamente",
-        "job_id": job_id,
-        "job": job
-    }
+    return {"message": "Trabajo creado exitosamente", "job_id": job_id, "job": job}
 
 # ==================== RUTAS DE UPLOAD POR CHUNKS ====================
 
@@ -1172,8 +2060,7 @@ async def cancel_chunked_upload(session_id: str):
 async def get_jobs():
     """Obtener lista de todos los trabajos"""
     jobs = list(jobs_db.values())
-    # Ordenar por fecha de creación (más recientes primero)
-    jobs.sort(key=lambda x: x["created_at"], reverse=True)
+    jobs.sort(key=lambda x: x.get("created_at", datetime.min), reverse=True)
     return jobs
 
 @app.get("/api/v1/jobs/{job_id}")
@@ -1224,152 +2111,6 @@ async def cancel_job(job_id: str):
     else:
         raise HTTPException(status_code=400, detail="El trabajo no se puede cancelar")
 
-@app.get("/api/v1/jobs/{job_id}/download")
-async def download_result(job_id: str, frame: Optional[int] = None):
-    """Descargar resultado del render - frame específico o primer frame"""
-    if job_id not in jobs_db:
-        raise HTTPException(status_code=404, detail="Trabajo no encontrado")
-    
-    job = jobs_db[job_id]
-    
-    if job["status"] != "completed":
-        raise HTTPException(status_code=400, detail="El trabajo no está completado")
-    
-    if not job["output_path"]:
-        raise HTTPException(status_code=404, detail="No se encontró resultado")
-    
-    # Buscar archivos de imagen
-    output_dir = Path(job["output_path"])
-    image_files = sorted(list(output_dir.glob("frame_*.png")) + list(output_dir.glob("frame_*.jpg")) + list(output_dir.glob("frame_*.exr")))
-    
-    if not image_files:
-        raise HTTPException(status_code=404, detail="No se encontraron imágenes renderizadas")
-    
-    # Si se especifica un frame, buscar ese frame específico
-    if frame is not None:
-        frame_file = None
-        for img_file in image_files:
-            if f"frame_{frame:04d}" in img_file.name:
-                frame_file = img_file
-                break
-        
-        if not frame_file:
-            raise HTTPException(status_code=404, detail=f"Frame {frame} no encontrado")
-        
-        return FileResponse(
-            path=str(frame_file),
-            filename=f"render_{job_id}_frame_{frame:04d}.png",
-            media_type="image/png"
-        )
-    
-    # Si no se especifica frame, devolver el primer frame
-    return FileResponse(
-        path=str(image_files[0]),
-        filename=f"render_{job_id}_preview.png",
-        media_type="image/png"
-    )
-
-@app.get("/api/v1/jobs/{job_id}/frames")
-async def get_job_frames(job_id: str):
-    """Obtener lista de todos los frames renderizados"""
-    if job_id not in jobs_db:
-        raise HTTPException(status_code=404, detail="Trabajo no encontrado")
-    
-    job = jobs_db[job_id]
-    
-    if job["status"] != "completed":
-        return {
-            "has_frames": False,
-            "status": job["status"],
-            "message": f"Trabajo en estado: {job['status']}"
-        }
-    
-    if not job["output_path"]:
-        return {
-            "has_frames": False,
-            "message": "No se encontró directorio de salida"
-        }
-    
-    # Buscar archivos de imagen
-    output_dir = Path(job["output_path"])
-    image_files = sorted(list(output_dir.glob("frame_*.png")) + list(output_dir.glob("frame_*.jpg")) + list(output_dir.glob("frame_*.exr")))
-    
-    if not image_files:
-        return {
-            "has_frames": False,
-            "message": "No se encontraron imágenes renderizadas"
-        }
-    
-    # Extraer números de frame
-    frames = []
-    for img_file in image_files:
-        try:
-            # Extraer número de frame del nombre del archivo
-            import re
-            frame_match = re.search(r'frame_(\d+)', img_file.name)
-            if frame_match:
-                frame_num = int(frame_match.group(1))
-                frames.append({
-                    "frame_number": frame_num,
-                    "filename": img_file.name,
-                    "file_size": img_file.stat().st_size,
-                    "download_url": f"/api/v1/jobs/{job_id}/download?frame={frame_num}"
-                })
-        except:
-            continue
-    
-    return {
-        "has_frames": True,
-        "total_frames": len(frames),
-        "frame_start": job.get("frame_start", 1),
-        "frame_end": job.get("frame_end", 1),
-        "frames": frames,
-        "output_dir": str(output_dir),
-        "preview_url": f"/api/v1/jobs/{job_id}/download"  # Primer frame como preview
-    }
-
-@app.get("/api/v1/jobs/{job_id}/download-all")
-async def download_all_frames(job_id: str):
-    """Descargar todos los frames como ZIP"""
-    if job_id not in jobs_db:
-        raise HTTPException(status_code=404, detail="Trabajo no encontrado")
-    
-    job = jobs_db[job_id]
-    
-    if job["status"] != "completed":
-        raise HTTPException(status_code=400, detail="El trabajo no está completado")
-    
-    if not job["output_path"]:
-        raise HTTPException(status_code=404, detail="No se encontró resultado")
-    
-    # Buscar archivos de imagen
-    output_dir = Path(job["output_path"])
-    image_files = list(output_dir.glob("frame_*.png")) + list(output_dir.glob("frame_*.jpg")) + list(output_dir.glob("frame_*.exr"))
-    
-    if not image_files:
-        raise HTTPException(status_code=404, detail="No se encontraron imágenes renderizadas")
-    
-    # Crear ZIP en memoria
-    import zipfile
-    from io import BytesIO
-    
-    zip_buffer = BytesIO()
-    
-    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-        for img_file in sorted(image_files):
-            zip_file.write(img_file, img_file.name)
-    
-    zip_buffer.seek(0)
-    
-    # Devolver ZIP como respuesta
-    from fastapi.responses import StreamingResponse
-    
-    return StreamingResponse(
-        BytesIO(zip_buffer.read()),
-        media_type="application/zip",
-        headers={"Content-Disposition": f"attachment; filename=render_{job_id}_all_frames.zip"}
-    )
-
 @app.get("/api/v1/jobs/{job_id}/preview")
 async def get_job_preview(job_id: str):
     """Obtener preview del render (para mostrar en la interfaz)"""
@@ -1411,6 +2152,274 @@ async def get_job_preview(job_id: str):
         "total_frames": len(image_files),
         "output_dir": str(output_dir)
     }
+
+@app.get("/api/v1/jobs/{job_id}/download-blend")
+async def download_blend_file(job_id: str):
+    """Descargar archivo .blend del trabajo"""
+    if job_id not in jobs_db:
+        raise HTTPException(status_code=404, detail="Trabajo no encontrado")
+    
+    job = jobs_db[job_id]
+    file_path = Path(job["file_path"])
+    
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Archivo .blend no encontrado")
+        
+    return FileResponse(
+        path=file_path, 
+        filename=file_path.name,
+        media_type="application/octet-stream"
+    )
+
+@app.post("/api/v1/jobs/{job_id}/upload-result")
+async def upload_job_result(job_id: str, file: UploadFile = File(...)):
+    """Permite que un nodo suba un frame renderizado."""
+    if job_id not in jobs_db:
+        raise HTTPException(status_code=404, detail="Trabajo no encontrado")
+
+    job_output_dir = OUTPUT_DIR / job_id
+    job_output_dir.mkdir(exist_ok=True)
+    file_path = job_output_dir / file.filename
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    job = jobs_db[job_id]
+    job["frames_rendered"] = len(list(job_output_dir.glob("*.png")))
+    job["progress"] = min(int((job["frames_rendered"] / job["frames_total"]) * 100), 99)
+
+    print(f"🖼️ Frame '{file.filename}' recibido para el trabajo {job_id}")
+    return {"message": "Frame subido exitosamente", "filename": file.filename}
+
+@app.post("/api/v1/jobs/{job_id}/update-status")
+async def update_job_status_from_node(job_id: str, status_update: JobStatusUpdate):
+    """Permite que un nodo actualice el estado final de un trabajo."""
+    if job_id not in jobs_db:
+        print(f"⚠️ Se recibió actualización para un trabajo no encontrado: {job_id}")
+        return {"message": "Actualización recibida para trabajo no encontrado."}
+
+    job = jobs_db[job_id]
+    
+    job.update({
+        "status": status_update.status,
+        "completed_at": datetime.now(),
+        "error_message": status_update.error_message
+    })
+    
+    if job.get("started_at"):
+        duration = job["completed_at"] - job["started_at"]
+        job["render_time"] = str(duration).split('.')[0]
+
+    if status_update.status == "completed":
+        job["progress"] = 100
+        print(f"✅ Trabajo {job_id} marcado como COMPLETADO por el nodo.")
+    else:
+        print(f"❌ Trabajo {job_id} marcado como FALLIDO. Razón: {status_update.error_message}")
+
+    return {"message": "Estado del trabajo actualizado exitosamente."}
+
+
+# ==================== RUTAS DE GESTIÓN DE NODOS ====================
+
+@app.post("/api/v1/nodes/register")
+async def register_node(node_data: Dict[str, Any]):
+    """Permite que un nuevo nodo se registre en el sistema."""
+    try:
+        node_id = node_data.get("node_id")
+        if not node_id:
+            raise HTTPException(status_code=400, detail="Falta node_id")
+
+        node_name = node_data.get("node_name", "Nodo sin nombre")
+        
+        if node_id in nodes_db:
+            print(f"🖥️ Nodo {node_name} ({node_id[:8]}) se ha reconectado.")
+        else:
+            print(f"✅ Nuevo nodo registrado: {node_name} ({node_id[:8]})")
+        
+        # Procesar datos del nodo de forma segura
+        node_info = node_data.get("node_info", {})
+        system_stats = node_data.get("system_stats", {})
+        capabilities = node_data.get("capabilities", {})
+        
+        # Guardar información del nodo
+        nodes_db[node_id] = {
+            "id": node_id,
+            "name": node_name,
+            "ip": node_info.get("hostname", "N/A"),
+            "status": "idle", 
+            "last_seen": datetime.now(),
+            "node_info": node_info,
+            "system_stats": system_stats,
+            "config": node_data.get("config", {}),
+            "capabilities": capabilities,
+            "current_job": None,
+            "active_jobs": 0  # Añadir contador de trabajos activos
+        }
+        
+        return {
+            "message": "Nodo registrado exitosamente", 
+            "node_id": node_id,
+            "server_time": datetime.now().isoformat(),
+            "heartbeat_interval": 15,
+            "next_heartbeat": (datetime.now() + timedelta(seconds=15)).isoformat()
+        }
+        
+    except Exception as e:
+        print(f"Error registrando nodo: {e}")
+        raise HTTPException(status_code=500, detail=f"Error registrando nodo: {str(e)}")
+
+@app.post("/api/v1/nodes/heartbeat")
+async def node_heartbeat(heartbeat_data: Dict[str, Any]):
+    """Recibe un heartbeat de un nodo."""
+    try:
+        node_id = heartbeat_data.get("node_id")
+        if not node_id:
+            raise HTTPException(status_code=400, detail="Falta node_id en heartbeat")
+            
+        if node_id not in nodes_db:
+            # Si el nodo no está registrado, pedirle que se registre de nuevo
+            raise HTTPException(
+                status_code=404, 
+                detail="Nodo no registrado. Por favor, regístrese de nuevo."
+            )
+        
+        # Actualizar información del nodo de forma segura
+        nodes_db[node_id]["last_seen"] = datetime.now()
+        
+        # Actualizar status si está presente
+        if "status" in heartbeat_data:
+            nodes_db[node_id]["status"] = heartbeat_data["status"]
+        
+        # Actualizar estadísticas del sistema si están presentes
+        if "system_stats" in heartbeat_data:
+            nodes_db[node_id]["system_stats"] = heartbeat_data["system_stats"]
+        
+        # Procesar información de trabajos si está presente
+        if "job_statuses" in heartbeat_data:
+            job_statuses = heartbeat_data["job_statuses"]
+            for job_id, job_status in job_statuses.items():
+                if job_id in jobs_db:
+                    # Actualizar estado del trabajo de forma segura
+                    if "status" in job_status:
+                        jobs_db[job_id]["status"] = job_status["status"]
+                    if "progress" in job_status:
+                        jobs_db[job_id]["progress"] = job_status["progress"]
+                    if "frame_current" in job_status:
+                        jobs_db[job_id]["frame_current"] = job_status["frame_current"]
+                    if "frame_total" in job_status:
+                        jobs_db[job_id]["frame_total"] = job_status["frame_total"]
+                    
+                    # Manejar finalización de trabajo
+                    if job_status.get("status") == "completed":
+                        jobs_db[job_id]["status"] = "completed"
+                        jobs_db[job_id]["completed_at"] = datetime.now()
+                        jobs_db[job_id]["progress"] = 100
+                        
+                        # Actualizar contador del nodo
+                        if "active_jobs" in nodes_db[node_id]:
+                            nodes_db[node_id]["active_jobs"] = max(0, nodes_db[node_id]["active_jobs"] - 1)
+                        
+                        print(f"✅ Trabajo {job_id} completado por nodo {node_id}")
+                    
+                    elif job_status.get("status") == "failed":
+                        jobs_db[job_id]["status"] = "failed"
+                        jobs_db[job_id]["error_message"] = job_status.get("error_message", "Error desconocido")
+                        jobs_db[job_id]["completed_at"] = datetime.now()
+                        
+                        # Actualizar contador del nodo
+                        if "active_jobs" in nodes_db[node_id]:
+                            nodes_db[node_id]["active_jobs"] = max(0, nodes_db[node_id]["active_jobs"] - 1)
+                        
+                        print(f"❌ Trabajo {job_id} falló en nodo {node_id}: {job_status.get('error_message', 'Error desconocido')}")
+        
+        return {
+            "message": "Heartbeat recibido",
+            "server_time": datetime.now().isoformat(),
+            "next_heartbeat": (datetime.now() + timedelta(seconds=15)).isoformat()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error procesando heartbeat de nodo {heartbeat_data.get('node_id', 'unknown')}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error procesando heartbeat: {str(e)}")
+
+
+@app.get("/api/v1/nodes/{node_id}/poll")
+async def poll_job_for_node(node_id: str):
+    """Consultar si hay trabajos disponibles para un nodo específico"""
+    try:
+        if node_id not in nodes_db:
+            raise HTTPException(
+                status_code=404, 
+                detail="Nodo no registrado"
+            )
+        
+        node_info = nodes_db[node_id]
+        
+        # Verificar si el nodo puede tomar más trabajos
+        max_jobs = node_info.get("capabilities", {}).get("max_concurrent_jobs", 1)
+        current_jobs = node_info.get("active_jobs", 0)
+        
+        if current_jobs >= max_jobs:
+            # Nodo ocupado - devolver 204 No Content
+            return Response(status_code=204)
+        
+        # Buscar trabajos pendientes (ordenados por fecha de creación)
+        pending_jobs = [
+            job for job in jobs_db.values() 
+            if job["status"] == "pending"
+        ]
+        
+        if not pending_jobs:
+            # No hay trabajos disponibles - devolver 204 No Content
+            return Response(status_code=204)
+        
+        # Ordenar por fecha de creación y tomar el más antiguo
+        pending_jobs.sort(key=lambda x: x.get("created_at", datetime.min))
+        job = pending_jobs[0]
+        job_id = job["id"]
+        
+        # Asignar trabajo al nodo
+        jobs_db[job_id]["status"] = "processing"
+        jobs_db[job_id]["started_at"] = datetime.now()
+        jobs_db[job_id]["assigned_node"] = node_id
+        
+        # Actualizar contador de trabajos activos del nodo
+        if "active_jobs" not in nodes_db[node_id]:
+            nodes_db[node_id]["active_jobs"] = 0
+        nodes_db[node_id]["active_jobs"] += 1
+        nodes_db[node_id]["status"] = "rendering"
+        
+        print(f"🎬 Trabajo {job_id} asignado a nodo {node_id} ({node_info.get('name', 'Sin nombre')})")
+        
+        # Preparar datos del trabajo para el nodo (compatible con node_agent.py)
+        job_data = {
+            "job_id": job_id,  # Usar job_id en lugar de id
+            "name": job["name"],
+            "start_frame": job.get("frame_start", 1),
+            "end_frame": job.get("frame_end", 1),
+            "output_format": job.get("output_format", "PNG"),
+            "engine": job.get("engine", "CYCLES"),
+            "samples": job.get("samples", 128),
+            "created_at": job["created_at"].isoformat() if isinstance(job["created_at"], datetime) else str(job["created_at"]),
+            "file_path": job.get("file_path", ""),
+            "original_filename": job.get("original_filename", "")
+        }
+        
+        return job_data
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error polling trabajo para nodo {node_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error consultando trabajo: {str(e)}")
+
+# Endpoint alternativo para compatibilidad
+@app.get("/api/v1/nodes/{node_id}/poll-job")
+async def poll_for_job_alt(node_id: str):
+    """Alias para compatibilidad con diferentes versiones del cliente"""
+    return await poll_job_for_node(node_id)
+
 
 # ==================== RUTAS DE ESTADO ====================
 

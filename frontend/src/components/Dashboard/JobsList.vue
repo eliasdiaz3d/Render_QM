@@ -91,17 +91,33 @@
                   v-if="job.status === 'completed'"
                   @click="viewRender(job)"
                   class="p-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors"
-                  title="Ver render"
+                  title="Ver primer frame"
                 >
                   👁️
                 </button>
                 <button
                   v-if="job.status === 'completed'"
-                  @click="downloadRender(job)"
+                  @click="viewAllFrames(job)"
                   class="p-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
-                  title="Descargar render"
+                  title="Ver todos los frames"
+                >
+                  🎬
+                </button>
+                <button
+                  v-if="job.status === 'completed'"
+                  @click="downloadRender(job)"
+                  class="p-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition-colors"
+                  title="Descargar primer frame"
                 >
                   📥
+                </button>
+                <button
+                  v-if="job.status === 'completed' && job.frames_total > 1"
+                  @click="downloadAllFrames(job)"
+                  class="p-2 bg-orange-600 text-white rounded-lg hover:bg-orange-700 transition-colors"
+                  title="Descargar todos los frames (ZIP)"
+                >
+                  📦
                 </button>
                 <button
                   v-if="job.status === 'processing' || job.status === 'pending'"
@@ -125,14 +141,29 @@
           <!-- Progress bar para trabajos en progreso -->
           <div v-if="job.status === 'processing'" class="mb-4">
             <div class="flex justify-between text-sm text-gray-400 mb-1">
-              <span>Progreso</span>
-              <span>{{ job.progress }}%</span>
+              <span>Progreso del Render</span>
+              <span>
+                {{ job.progress }}% - 
+                <span class="text-blue-400">{{ job.frames_rendered || 0 }}</span>/<span class="text-white">{{ job.frames_total || 1 }}</span> frames
+              </span>
             </div>
-            <div class="w-full bg-gray-700 rounded-full h-2">
+            <div class="w-full bg-gray-700 rounded-full h-3 relative">
               <div 
-                class="bg-blue-600 h-2 rounded-full transition-all duration-500"
-                :style="{ width: job.progress + '%' }"
-              ></div>
+                class="bg-gradient-to-r from-blue-500 to-green-500 h-3 rounded-full transition-all duration-500 relative overflow-hidden"
+                :style="{ width: Math.max(job.progress, 2) + '%' }"
+              >
+                <!-- Animación de progreso -->
+                <div class="absolute inset-0 bg-gradient-to-r from-transparent via-white to-transparent opacity-30 -skew-x-12 animate-shimmer"></div>
+              </div>
+              <!-- Marcador de frames esperados -->
+              <div class="absolute top-0 right-2 h-3 flex items-center">
+                <span class="text-xs text-gray-300 font-medium">{{ job.frames_total }}</span>
+              </div>
+            </div>
+            <!-- ETA estimado -->
+            <div class="flex justify-between text-xs text-gray-400 mt-1">
+              <span>{{ formatRenderSpeed(job) }}</span>
+              <span>{{ estimateTimeRemaining(job) }}</span>
             </div>
           </div>
 
@@ -202,6 +233,61 @@
         </div>
       </div>
     </div>
+
+    <!-- Modal para mostrar todos los frames -->
+    <div v-if="showFramesModal" class="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50" @click="closeRenderModal">
+      <div class="max-w-6xl max-h-screen p-4 w-full" @click.stop>
+        <div class="bg-gray-800 rounded-lg overflow-hidden">
+          <div class="flex items-center justify-between p-4 border-b border-gray-700">
+            <h3 class="text-xl font-semibold text-white">
+              Todos los Frames - {{ selectedJob?.name }}
+            </h3>
+            <div class="flex items-center space-x-2">
+              <span class="text-sm text-gray-400">{{ allFrames.length }} frames</span>
+              <button @click="closeRenderModal" class="text-gray-400 hover:text-white">
+                ✕
+              </button>
+            </div>
+          </div>
+          <div class="p-4 max-h-96 overflow-y-auto">
+            <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
+              <div v-for="frame in allFrames" :key="frame.frame_number" class="relative group">
+                <img 
+                  :src="`http://localhost:8000${frame.download_url}`" 
+                  :alt="`Frame ${frame.frame_number}`"
+                  class="w-full h-24 object-cover rounded-lg cursor-pointer hover:opacity-80 transition-opacity"
+                  @click="viewSingleFrame(frame)"
+                />
+                <div class="absolute bottom-1 left-1 bg-black bg-opacity-75 text-white text-xs px-1 rounded">
+                  {{ frame.frame_number }}
+                </div>
+                <button 
+                  @click="downloadSingleFrame(frame)"
+                  class="absolute top-1 right-1 bg-blue-600 text-white text-xs p-1 rounded opacity-0 group-hover:opacity-100 transition-opacity"
+                  title="Descargar frame"
+                >
+                  📥
+                </button>
+              </div>
+            </div>
+          </div>
+          <div class="p-4 border-t border-gray-700 flex justify-between">
+            <button
+              @click="downloadAllFrames(selectedJob)"
+              class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
+            >
+              📦 Descargar Todos (ZIP)
+            </button>
+            <button
+              @click="closeRenderModal"
+              class="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 transition-colors"
+            >
+              Cerrar
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -216,8 +302,10 @@ export default {
       searchQuery: '',
       statusFilter: '',
       showRenderModal: false,
+      showFramesModal: false,
       selectedJob: null,
-      renderImageUrl: ''
+      renderImageUrl: '',
+      allFrames: []
     }
   },
   computed: {
@@ -324,6 +412,25 @@ export default {
       this.showRenderModal = true;
     },
     
+    async viewAllFrames(job) {
+      try {
+        const response = await fetch(`http://localhost:8000/api/v1/jobs/${job.id}/frames`);
+        if (response.ok) {
+          const framesData = await response.json();
+          if (framesData.has_frames) {
+            this.selectedJob = job;
+            this.allFrames = framesData.frames;
+            this.showFramesModal = true;
+          } else {
+            alert('No se encontraron frames para este trabajo');
+          }
+        }
+      } catch (error) {
+        console.error('Error loading frames:', error);
+        alert('Error al cargar los frames');
+      }
+    },
+    
     async downloadRender(job) {
       try {
         const link = document.createElement('a');
@@ -335,6 +442,20 @@ export default {
       } catch (error) {
         console.error('Error downloading render:', error);
         alert('Error al descargar el render');
+      }
+    },
+    
+    async downloadAllFrames(job) {
+      try {
+        const link = document.createElement('a');
+        link.href = `http://localhost:8000/api/v1/jobs/${job.id}/download-all`;
+        link.download = `render_${job.name}_all_frames.zip`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+      } catch (error) {
+        console.error('Error downloading all frames:', error);
+        alert('Error al descargar todos los frames');
       }
     },
     
@@ -380,8 +501,70 @@ export default {
     
     closeRenderModal() {
       this.showRenderModal = false;
+      this.showFramesModal = false;
       this.selectedJob = null;
       this.renderImageUrl = '';
+      this.allFrames = [];
+    },
+    
+    viewSingleFrame(frame) {
+      this.renderImageUrl = `http://localhost:8000${frame.download_url}`;
+      this.showFramesModal = false;
+      this.showRenderModal = true;
+    },
+    
+    downloadSingleFrame(frame) {
+      const link = document.createElement('a');
+      link.href = `http://localhost:8000${frame.download_url}`;
+      link.download = frame.filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    },
+    
+    formatRenderSpeed(job) {
+      if (!job.frames_rendered || !job.started_at) return '';
+      
+      const startTime = new Date(job.started_at);
+      const now = new Date();
+      const elapsedMinutes = (now - startTime) / (1000 * 60);
+      
+      if (elapsedMinutes < 0.1) return 'Calculando velocidad...';
+      
+      const framesPerMinute = job.frames_rendered / elapsedMinutes;
+      
+      if (framesPerMinute < 1) {
+        const minutesPerFrame = 1 / framesPerMinute;
+        return `~${minutesPerFrame.toFixed(1)} min/frame`;
+      } else {
+        return `~${framesPerMinute.toFixed(1)} frames/min`;
+      }
+    },
+    
+    estimateTimeRemaining(job) {
+      if (!job.frames_rendered || job.frames_rendered === 0 || !job.started_at) {
+        return 'Estimando tiempo...';
+      }
+      
+      const framesRemaining = job.frames_total - job.frames_rendered;
+      if (framesRemaining <= 0) return 'Finalizando...';
+      
+      const startTime = new Date(job.started_at);
+      const now = new Date();
+      const elapsedMinutes = (now - startTime) / (1000 * 60);
+      
+      const averageTimePerFrame = elapsedMinutes / job.frames_rendered;
+      const estimatedMinutesRemaining = averageTimePerFrame * framesRemaining;
+      
+      if (estimatedMinutesRemaining < 1) {
+        return 'Menos de 1 minuto';
+      } else if (estimatedMinutesRemaining < 60) {
+        return `~${Math.round(estimatedMinutesRemaining)} minutos restantes`;
+      } else {
+        const hours = Math.floor(estimatedMinutesRemaining / 60);
+        const minutes = Math.round(estimatedMinutesRemaining % 60);
+        return `~${hours}h ${minutes}m restantes`;
+      }
     },
     
     onImageError() {
@@ -404,5 +587,15 @@ export default {
 
 .animate-spin {
   animation: spin 1s linear infinite;
+}
+
+/* Animación shimmer para barra de progreso */
+@keyframes shimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+.animate-shimmer {
+  animation: shimmer 2s infinite;
 }
 </style>
