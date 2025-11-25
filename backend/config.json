@@ -1,10 +1,10 @@
 {
   "blender": {
-    "path": "C:\\Users\\INTEL\\Desktop\\blender-5.0.0-alpha+main.083cc599f947-windows.amd64-release\\blender.exe",
+    "path": "C:\\Program Files\\Blender Foundation\\Blender 5.0\\blender.exe",
     "auto_detect": true,
-    "custom_path": "C:\\Users\\INTEL\\Desktop\\blender-5.0.0-alpha+main.083cc599f947-windows.amd64-release\\blender.exe",
+    "custom_path": "C:\\Program Files\\Blender Foundation\\Blender 5.0\\blender.exe",
     "version": "5.0.0",
-    "last_verified": "2025-10-02T15:47:20.636107"
+    "last_verified": "2025-11-25T17:32:25.738716"
   },
   "render": {
     "default_engine": "CYCLES",

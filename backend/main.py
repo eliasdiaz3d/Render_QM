@@ -283,7 +283,7 @@ def scan_for_blender() -> List[Dict]:
                         capture_output=True, 
                         text=True, 
                         encoding="utf-8",
-                        error="replace",
+                        errors="replace",
                         timeout=10,
                         creationflags=subprocess.CREATE_NO_WINDOW
                     )
@@ -361,7 +361,7 @@ def verify_blender_path(path: str) -> Dict:
                 capture_output=True, 
                 text=True, 
                 encoding="utf-8",
-                error="replace",
+                errors="replace",
                 timeout=10,
                 creationflags=subprocess.CREATE_NO_WINDOW
             )
@@ -395,7 +395,7 @@ def verify_blender_path(path: str) -> Dict:
                 capture_output=True, 
                 text=True,
                 encoding="utf-8",
-                error="replace", 
+                errors="replace", 
                 timeout=30,
                 creationflags=subprocess.CREATE_NO_WINDOW
             )
