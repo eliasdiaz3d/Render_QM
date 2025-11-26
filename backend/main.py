@@ -884,92 +884,151 @@ async def analyze_blend_file(file: UploadFile = File(...)):
             os.remove(temp_file_path)
 
 @app.get("/api/v1/jobs/{job_id}/download-result")
-async def download_job_result(job_id: str, frame: Optional[int] = None):
-    """Descargar resultado del render - frame específico o primer frame (usado por navegador)"""
+async def download_job_result_enhanced(job_id: str, frame: Optional[int] = None):
+    """
+    Descargar resultado del render - MEJORADO CON MEJOR MANEJO DE ERRORES
+    """
     if job_id not in jobs_db:
         raise HTTPException(status_code=404, detail="Trabajo no encontrado")
     
     job = jobs_db[job_id]
     
     if job["status"] != "completed":
-        raise HTTPException(status_code=400, detail="El trabajo no está completado")
+        raise HTTPException(
+            status_code=400, 
+            detail=f"El trabajo no está completado. Estado actual: {job['status']}, Progreso: {job.get('progress', 0)}%"
+        )
     
-    # Buscar archivos de imagen en directorios posibles
+    # Buscar archivos en múltiples ubicaciones
     possible_dirs = []
     if job.get("output_path"):
         possible_dirs.append(Path(job["output_path"]))
     possible_dirs.append(OUTPUT_DIR / job_id)
     
     image_files = []
+    extensions = ["*.png", "*.jpg", "*.jpeg", "*.exr", "*.tiff", "*.tif"]
+    
     for output_dir in possible_dirs:
         if output_dir.exists():
-            extensions = ["*.png", "*.jpg", "*.jpeg", "*.exr", "*.tiff"]
             for ext in extensions:
-                image_files.extend(list(output_dir.glob(ext)))
-                image_files.extend(list(output_dir.glob(f"**/{ext}")))
+                found = list(output_dir.glob(ext))
+                image_files.extend(found)
+            
+            if image_files:
+                break  # Encontró archivos, no seguir buscando
     
-    image_files = sorted(image_files)
+    image_files = sorted(set(image_files))
     
     if not image_files:
-        raise HTTPException(status_code=404, detail="No se encontraron imágenes renderizadas")
+        # Error detallado
+        searched_paths = [str(d) for d in possible_dirs]
+        raise HTTPException(
+            status_code=404, 
+            detail=f"No se encontraron imágenes renderizadas. Búsqueda en: {', '.join(searched_paths)}"
+        )
     
-    # Si se especifica un frame, buscar ese frame específico
+    # Si se especifica frame, buscar ese frame
     if frame is not None:
         target_file = None
         for img_file in image_files:
-            if f"{frame:04d}" in img_file.name:
+            # Patrones de búsqueda flexibles
+            if (f"{frame:04d}" in img_file.name or 
+                f"{frame:03d}" in img_file.name or 
+                f"{frame:02d}" in img_file.name or 
+                f"_{frame}." in img_file.name):
                 target_file = img_file
                 break
         
         if not target_file:
-            raise HTTPException(status_code=404, detail=f"Frame {frame} no encontrado")
+            raise HTTPException(
+                status_code=404, 
+                detail=f"Frame {frame} no encontrado. Frames disponibles: {[f.name for f in image_files[:10]]}"
+            )
         
         return FileResponse(path=target_file, filename=target_file.name)
     
-    # Devolver primer frame por defecto
+    # Devolver primer frame
     first_file = image_files[0]
     return FileResponse(path=first_file, filename=first_file.name)
 
+
 @app.post("/api/v1/jobs/{job_id}/upload-result")
 async def upload_job_result(job_id: str, file: UploadFile = File(...)):
-    """Subir resultado de render desde nodo"""
+    """Subir frame - CON AUTO-COMPLETADO QUE FUNCIONA"""
     try:
         if job_id not in jobs_db:
             raise HTTPException(status_code=404, detail="Trabajo no encontrado")
         
-        # Crear directorio de salida para el trabajo
+        job = jobs_db[job_id]
+        
+        # Crear directorio
         job_output_dir = OUTPUT_DIR / job_id
         job_output_dir.mkdir(exist_ok=True)
         
-        # Guardar archivo resultado
+        # Guardar archivo
         file_path = job_output_dir / file.filename
-        
         with open(file_path, "wb") as buffer:
             content = await file.read()
             buffer.write(content)
         
-        # Actualizar información del trabajo
-        if "output_files" not in jobs_db[job_id]:
-            jobs_db[job_id]["output_files"] = []
+        # Inicializar lista
+        if "output_files" not in job:
+            job["output_files"] = []
         
-        jobs_db[job_id]["output_files"].append({
-            "filename": file.filename,
-            "path": str(file_path),
-            "size": len(content),
-            "uploaded_at": datetime.now().isoformat()
-        })
+        # Evitar duplicados
+        if not any(f["filename"] == file.filename for f in job["output_files"]):
+            job["output_files"].append({
+                "filename": file.filename,
+                "path": str(file_path),
+                "size": len(content),
+                "uploaded_at": datetime.now().isoformat()
+            })
         
-        print(f"📁 Archivo resultado recibido para trabajo {job_id}: {file.filename}")
+        # Contar
+        total_frames = job.get("frames_total", 0)
+        frames_rendered = len(job["output_files"])
+        job["frames_rendered"] = frames_rendered
+        
+        # Progreso
+        if total_frames > 0:
+            progress = min(int((frames_rendered / total_frames) * 100), 99 if frames_rendered < total_frames else 100)
+            job["progress"] = progress
+        
+        # Output path
+        if not job.get("output_path"):
+            job["output_path"] = str(job_output_dir)
+        
+        print(f"📁 Frame {frames_rendered}/{total_frames}: {file.filename} ({job['progress']}%)")
+        
+        # ===== AUTO-COMPLETAR =====
+        if frames_rendered == total_frames and total_frames > 0 and job["status"] != "completed":
+            job["status"] = "completed"
+            job["completed_at"] = datetime.now()
+            job["progress"] = 100
+            
+            if job.get("started_at"):
+                started = job["started_at"] if isinstance(job["started_at"], datetime) else datetime.fromisoformat(job["started_at"])
+                job["render_time"] = str(datetime.now() - started).split('.')[0]
+            
+            print(f"\n{'='*60}")
+            print(f"✅ COMPLETADO: {job.get('name')}")
+            print(f"   Frames: {frames_rendered}/{total_frames}")
+            print(f"   Tiempo: {job.get('render_time', 'N/A')}")
+            print(f"{'='*60}\n")
         
         return {
-            "message": "Archivo resultado subido exitosamente",
+            "message": "Frame subido",
             "filename": file.filename,
-            "size": len(content)
+            "frames_rendered": frames_rendered,
+            "frames_total": total_frames,
+            "progress": job["progress"],
+            "status": job["status"],
+            "is_completed": job["status"] == "completed"
         }
         
     except Exception as e:
-        print(f"Error subiendo resultado para trabajo {job_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Error subiendo resultado: {str(e)}")
+        print(f"❌ Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/v1/jobs/{job_id}/download")
 async def download_job_file(job_id: str, format: str = "zip"):
@@ -1144,7 +1203,10 @@ async def get_nodes_statistics():
     
 @app.get("/api/v1/jobs/{job_id}/frames")
 async def get_job_frames(job_id: str):
-    """Obtener lista de todos los frames renderizados"""
+    """
+    Obtener lista de todos los frames renderizados
+    MEJORADO: Devuelve URLs correctas para el frontend
+    """
     if job_id not in jobs_db:
         raise HTTPException(status_code=404, detail="Trabajo no encontrado")
     
@@ -1157,22 +1219,22 @@ async def get_job_frames(job_id: str):
             "message": f"Trabajo en estado: {job['status']}"
         }
     
-    if not job["output_path"]:
-        return {
-            "has_frames": False,
-            "message": "No se encontró directorio de salida"
-        }
+    # Buscar archivos de imagen
+    possible_dirs = []
+    if job.get("output_path"):
+        possible_dirs.append(Path(job["output_path"]))
+    possible_dirs.append(OUTPUT_DIR / job_id)
     
-    # Buscar archivos de imagen con múltiples extensiones
-    output_dir = Path(job["output_path"])
-    common_extensions = ["*.png", "*.jpg", "*.jpeg", "*.exr", "*.tiff", "*.tif"]
     image_files = []
+    extensions = ["*.png", "*.jpg", "*.jpeg", "*.exr", "*.tiff", "*.tif"]
     
-    for ext in common_extensions:
-        image_files.extend(list(output_dir.glob(ext)))
-        image_files.extend(list(output_dir.glob("**/" + ext)))
+    for output_dir in possible_dirs:
+        if output_dir.exists():
+            for ext in extensions:
+                image_files.extend(list(output_dir.glob(ext)))
+                image_files.extend(list(output_dir.glob(f"**/{ext}")))
     
-    image_files = sorted(image_files)
+    image_files = sorted(set(image_files))
     
     if not image_files:
         return {
@@ -1181,6 +1243,7 @@ async def get_job_frames(job_id: str):
         }
     
     # Extraer números de frame
+    import re
     frames = []
     for img_file in image_files:
         try:
@@ -1190,13 +1253,12 @@ async def get_job_frames(job_id: str):
                 frame_num = max(frame_matches, key=len)
                 frame_num = int(frame_num)
                 
-                # CORRECCIÓN: Usar rutas que sirvan los archivos correctamente
                 frames.append({
                     "frame_number": frame_num,
                     "filename": img_file.name,
                     "file_size": img_file.stat().st_size,
                     "download_url": f"/api/v1/jobs/{job_id}/frame/{frame_num}",
-                    "static_url": f"/renders/{job_id}/{img_file.name}",  # Ruta estática
+                    "static_url": f"/renders/{job_id}/{img_file.name}",
                     "full_path": str(img_file)
                 })
         except:
@@ -1210,13 +1272,16 @@ async def get_job_frames(job_id: str):
         "frame_start": job.get("frame_start", 1),
         "frame_end": job.get("frame_end", 1),
         "frames": frames,
-        "output_dir": str(output_dir),
-        "preview_url": f"/api/v1/jobs/{job_id}/download-first-frame"
+        "output_dir": str(possible_dirs[0]) if possible_dirs else None,
+        "preview_url": f"/api/v1/jobs/{job_id}/download-result"
     }
 
 @app.get("/api/v1/jobs/{job_id}/frame/{frame_num}")
 async def get_specific_frame(job_id: str, frame_num: int):
-    """Obtener un frame específico"""
+    """
+    Obtener un frame específico
+    MEJORADO: Búsqueda más flexible de frames
+    """
     if job_id not in jobs_db:
         raise HTTPException(status_code=404, detail="Trabajo no encontrado")
     
@@ -1225,17 +1290,20 @@ async def get_specific_frame(job_id: str, frame_num: int):
     if job["status"] != "completed":
         raise HTTPException(status_code=400, detail="El trabajo no está completado")
     
-    if not job["output_path"]:
-        raise HTTPException(status_code=404, detail="No se encontró directorio de salida")
+    # Buscar archivos
+    possible_dirs = []
+    if job.get("output_path"):
+        possible_dirs.append(Path(job["output_path"]))
+    possible_dirs.append(OUTPUT_DIR / job_id)
     
-    # Buscar archivos de imagen
-    output_dir = Path(job["output_path"])
-    common_extensions = ["*.png", "*.jpg", "*.jpeg", "*.exr", "*.tiff", "*.tif"]
     image_files = []
+    extensions = ["*.png", "*.jpg", "*.jpeg", "*.exr", "*.tiff", "*.tif"]
     
-    for ext in common_extensions:
-        image_files.extend(list(output_dir.glob(ext)))
-        image_files.extend(list(output_dir.glob("**/" + ext)))
+    for output_dir in possible_dirs:
+        if output_dir.exists():
+            for ext in extensions:
+                image_files.extend(list(output_dir.glob(ext)))
+                image_files.extend(list(output_dir.glob(f"**/{ext}")))
     
     # Buscar el frame específico
     frame_file = None
@@ -1256,7 +1324,10 @@ async def get_specific_frame(job_id: str, frame_num: int):
             break
     
     if not frame_file:
-        raise HTTPException(status_code=404, detail=f"Frame {frame_num} no encontrado")
+        raise HTTPException(
+            status_code=404, 
+            detail=f"Frame {frame_num} no encontrado. Archivos disponibles: {[f.name for f in image_files[:5]]}"
+        )
     
     # Determinar tipo MIME
     mime_type = "image/png"
@@ -1275,47 +1346,62 @@ async def get_specific_frame(job_id: str, frame_num: int):
 
 @app.get("/api/v1/jobs/{job_id}/download-all")
 async def download_all_frames(job_id: str):
-    """Descargar todos los frames como ZIP"""
+    """
+    Descargar todos los frames como ZIP
+    MEJORADO: Maneja errores y proporciona mejor feedback
+    """
     if job_id not in jobs_db:
         raise HTTPException(status_code=404, detail="Trabajo no encontrado")
     
     job = jobs_db[job_id]
     
     if job["status"] != "completed":
-        raise HTTPException(status_code=400, detail="El trabajo no está completado")
-    
-    if not job["output_path"]:
-        raise HTTPException(status_code=404, detail="No se encontró resultado")
+        raise HTTPException(
+            status_code=400, 
+            detail=f"El trabajo no está completado (estado actual: {job['status']})"
+        )
     
     # Buscar archivos de imagen
-    output_dir = Path(job["output_path"])
-    common_extensions = ["*.png", "*.jpg", "*.jpeg", "*.exr", "*.tiff", "*.tif"]
-    image_files = []
+    possible_dirs = []
+    if job.get("output_path"):
+        possible_dirs.append(Path(job["output_path"]))
+    possible_dirs.append(OUTPUT_DIR / job_id)
     
-    for ext in common_extensions:
-        image_files.extend(list(output_dir.glob(ext)))
-        image_files.extend(list(output_dir.glob("**/" + ext)))
+    image_files = []
+    extensions = ["*.png", "*.jpg", "*.jpeg", "*.exr", "*.tiff", "*.tif"]
+    
+    for output_dir in possible_dirs:
+        if output_dir.exists():
+            for ext in extensions:
+                image_files.extend(list(output_dir.glob(ext)))
+                image_files.extend(list(output_dir.glob(f"**/{ext}")))
+    
+    image_files = sorted(set(image_files))
     
     if not image_files:
         raise HTTPException(status_code=404, detail="No se encontraron imágenes renderizadas")
     
-    # Crear ZIP en memoria
-    zip_buffer = BytesIO()
-    
-    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-        for img_file in sorted(image_files):
-            # Usar path relativo al directorio de output para evitar paths absolutos en el ZIP
-            arcname = os.path.relpath(str(img_file), str(output_dir))
-            zip_file.write(img_file, arcname)
-    
-    zip_buffer.seek(0)
-    
-    # Devolver ZIP como respuesta
-    return StreamingResponse(
-        BytesIO(zip_buffer.read()),
-        media_type="application/zip",
-        headers={"Content-Disposition": f"attachment; filename=render_{job_id}_all_frames.zip"}
-    )
+    try:
+        # Crear ZIP en memoria
+        zip_buffer = BytesIO()
+        
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            for img_file in image_files:
+                # Usar solo el nombre del archivo en el ZIP
+                zip_file.write(img_file, img_file.name)
+        
+        zip_buffer.seek(0)
+        
+        return StreamingResponse(
+            BytesIO(zip_buffer.read()),
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f"attachment; filename=render_{job['name'].replace(' ', '_')}_{job_id[:8]}.zip"
+            }
+        )
+    except Exception as e:
+        print(f"Error creando ZIP para trabajo {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error creando archivo ZIP: {str(e)}")
 
 # ==================== ENDPOINTS FALTANTES ====================
 
@@ -2046,17 +2132,200 @@ async def cancel_chunked_upload(session_id: str):
 
 @app.get("/api/v1/jobs", response_model=List[dict])
 async def get_jobs():
-    """Obtener lista de todos los trabajos"""
-    jobs = list(jobs_db.values())
-    jobs.sort(key=lambda x: x.get("created_at", datetime.min), reverse=True)
+    """Obtener todos los trabajos - SERIALIZACIÓN PERFECTA"""
+    jobs = []
+    
+    for job in jobs_db.values():
+        # Serializar cada trabajo
+        serialized = {}
+        for key, value in job.items():
+            if isinstance(value, datetime):
+                serialized[key] = value.isoformat()
+            elif isinstance(value, Path):
+                serialized[key] = str(value)
+            elif key == "status":
+                serialized[key] = str(value)
+            else:
+                serialized[key] = value
+        
+        # Campos por defecto
+        serialized.setdefault("status", "unknown")
+        serialized.setdefault("progress", 0)
+        serialized.setdefault("frames_rendered", 0)
+        serialized.setdefault("frames_total", 0)
+        
+        # Flags booleanos para frontend
+        serialized["is_completed"] = serialized["status"] == "completed"
+        serialized["is_processing"] = serialized["status"] == "processing"
+        serialized["is_pending"] = serialized["status"] == "pending"
+        serialized["is_failed"] = serialized["status"] == "failed"
+        
+        # Verificar resultados
+        has_results = False
+        if serialized.get("output_path"):
+            output_dir = Path(serialized["output_path"])
+            if output_dir.exists():
+                files = list(output_dir.glob("*.png")) + list(output_dir.glob("*.jpg"))
+                has_results = len(files) > 0
+        
+        serialized["has_downloadable_results"] = has_results
+        
+        jobs.append(serialized)
+    
+    # Ordenar por fecha (más recientes primero)
+    jobs.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    
     return jobs
+
+@app.get("/api/v1/jobs/{job_id}/full-status")
+async def get_job_full_status(job_id: str):
+    """Diagnóstico completo del estado del trabajo"""
+    if job_id not in jobs_db:
+        return {
+            "error": "Trabajo no encontrado",
+            "job_id": job_id,
+            "available_jobs": list(jobs_db.keys())[:10]
+        }
+    
+    job = jobs_db[job_id]
+    
+    # Contar archivos en disco
+    output_dir = OUTPUT_DIR / job_id
+    files_on_disk = 0
+    disk_files = []
+    if output_dir.exists():
+        disk_files = list(output_dir.glob("*.png")) + list(output_dir.glob("*.jpg"))
+        files_on_disk = len(disk_files)
+    
+    # Info de archivos registrados
+    output_files = job.get("output_files", [])
+    
+    return {
+        "job_id": job_id,
+        "name": job.get("name"),
+        "status": job["status"],
+        "status_type": type(job["status"]).__name__,
+        "progress": job.get("progress"),
+        "frames_rendered": job.get("frames_rendered"),
+        "frames_total": job.get("frames_total"),
+        "completion_check": {
+            "frames_match": job.get("frames_rendered") == job.get("frames_total"),
+            "is_completed_status": job["status"] == "completed",
+            "should_be_completed": job.get("frames_rendered") == job.get("frames_total") and job.get("frames_total", 0) > 0
+        },
+        "files": {
+            "registered_count": len(output_files),
+            "on_disk_count": files_on_disk,
+            "match": len(output_files) == files_on_disk,
+            "registered_files": [f["filename"] for f in output_files][:10],
+            "disk_files": [f.name for f in disk_files][:10]
+        },
+        "paths": {
+            "output_path": str(job.get("output_path")),
+            "output_dir_exists": output_dir.exists()
+        },
+        "timing": {
+            "created_at": str(job.get("created_at")),
+            "started_at": str(job.get("started_at")),
+            "completed_at": str(job.get("completed_at")),
+            "render_time": job.get("render_time")
+        },
+        "frontend_flags": {
+            "is_completed": job["status"] == "completed",
+            "has_downloadable_results": files_on_disk > 0
+        }
+    }
+
+
+print("✅ Solución completa aplicada - Backend optimizado para frontend reactivo")
+
+@app.get("/api/v1/jobs/{job_id}/debug")
+async def debug_job_status(job_id: str):
+    """Debug: Ver estado real del trabajo en memoria"""
+    if job_id not in jobs_db:
+        # Mostrar trabajos disponibles
+        available_ids = list(jobs_db.keys())
+        return {
+            "error": "Trabajo no encontrado",
+            "job_id_searched": job_id,
+            "available_jobs": available_ids[:10],  # Primeros 10
+            "total_jobs": len(available_ids)
+        }
+    
+    job = jobs_db[job_id]
+    
+    # Info detallada del estado
+    debug = {
+        "job_id": job_id,
+        "status": job.get("status"),
+        "status_type": type(job.get("status")).__name__,
+        "progress": job.get("progress"),
+        "frames_rendered": job.get("frames_rendered"),
+        "frames_total": job.get("frames_total"),
+        "completed_at": str(job.get("completed_at")),
+        "output_path": str(job.get("output_path")),
+        "all_keys": list(job.keys())
+    }
+    
+    # Verificar archivos de output
+    output_path = job.get("output_path")
+    if output_path:
+        output_dir = Path(output_path)
+        if output_dir.exists():
+            files = list(output_dir.glob("*.*"))
+            debug["output_files_found"] = len(files)
+            debug["output_files_sample"] = [f.name for f in files[:5]]
+        else:
+            debug["output_dir_exists"] = False
+    
+    return debug
 
 @app.get("/api/v1/jobs/{job_id}")
 async def get_job(job_id: str):
-    """Obtener detalles de un trabajo específico"""
+    """Obtener trabajo - SERIALIZACIÓN PERFECTA"""
     if job_id not in jobs_db:
         raise HTTPException(status_code=404, detail="Trabajo no encontrado")
-    return jobs_db[job_id]
+    
+    job = jobs_db[job_id]
+    
+    # Serializar TODO correctamente
+    result = {}
+    for key, value in job.items():
+        if isinstance(value, datetime):
+            result[key] = value.isoformat()
+        elif isinstance(value, Path):
+            result[key] = str(value)
+        elif key == "status":
+            # CRÍTICO: Asegurar que status es string
+            result[key] = str(value)
+        else:
+            result[key] = value
+    
+    # Asegurar campos críticos existen
+    result.setdefault("status", "unknown")
+    result.setdefault("progress", 0)
+    result.setdefault("frames_rendered", 0)
+    result.setdefault("frames_total", 0)
+    
+    # ===== CRÍTICO para el frontend =====
+    # Agregar flag booleano explícito para el frontend
+    result["is_completed"] = result["status"] == "completed"
+    result["is_processing"] = result["status"] == "processing"
+    result["is_pending"] = result["status"] == "pending"
+    result["is_failed"] = result["status"] == "failed"
+    
+    # Verificar si tiene resultados descargables
+    has_results = False
+    if result.get("output_path"):
+        output_dir = Path(result["output_path"])
+        if output_dir.exists():
+            files = list(output_dir.glob("*.png")) + list(output_dir.glob("*.jpg"))
+            has_results = len(files) > 0
+    
+    result["has_downloadable_results"] = has_results
+    
+    return result
+
 
 @app.delete("/api/v1/jobs/{job_id}")
 async def delete_job(job_id: str):
@@ -2100,46 +2369,90 @@ async def cancel_job(job_id: str):
         raise HTTPException(status_code=400, detail="El trabajo no se puede cancelar")
 
 @app.get("/api/v1/jobs/{job_id}/preview")
-async def get_job_preview(job_id: str):
-    """Obtener preview del render (para mostrar en la interfaz)"""
+async def get_job_preview_enhanced(job_id: str):
+    """
+    Obtener preview del render - MEJORADO
+    Asegura que siempre devuelva info útil
+    """
     if job_id not in jobs_db:
         raise HTTPException(status_code=404, detail="Trabajo no encontrado")
     
     job = jobs_db[job_id]
     
+    # Información básica siempre disponible
+    base_info = {
+        "job_id": job_id,
+        "name": job.get("name", "Sin nombre"),
+        "status": job["status"],
+        "progress": job.get("progress", 0),
+        "frames_rendered": job.get("frames_rendered", 0),
+        "frames_total": job.get("frames_total", 0),
+        "render_time": job.get("render_time"),
+        "created_at": job.get("created_at").isoformat() if isinstance(job.get("created_at"), datetime) else job.get("created_at"),
+        "started_at": job.get("started_at").isoformat() if isinstance(job.get("started_at"), datetime) else job.get("started_at"),
+        "completed_at": job.get("completed_at").isoformat() if isinstance(job.get("completed_at"), datetime) else job.get("completed_at"),
+    }
+    
+    # Si no está completado, devolver info básica
     if job["status"] != "completed":
         return {
+            **base_info,
             "has_preview": False,
-            "status": job["status"],
             "message": f"Trabajo en estado: {job['status']}"
         }
     
-    if not job["output_path"]:
-        return {
-            "has_preview": False,
-            "message": "No se encontró directorio de salida"
-        }
-    
     # Buscar archivos de imagen
-    output_dir = Path(job["output_path"])
-    image_files = list(output_dir.glob("*.png")) + list(output_dir.glob("*.jpg")) + list(output_dir.glob("*.exr"))
+    possible_dirs = []
+    if job.get("output_path"):
+        possible_dirs.append(Path(job["output_path"]))
+    possible_dirs.append(OUTPUT_DIR / job_id)
+    
+    image_files = []
+    extensions = ["*.png", "*.jpg", "*.jpeg", "*.exr", "*.tiff", "*.tif"]
+    
+    output_dir_found = None
+    for output_dir in possible_dirs:
+        if output_dir.exists():
+            output_dir_found = output_dir
+            for ext in extensions:
+                image_files.extend(list(output_dir.glob(ext)))
+            if image_files:
+                break
+    
+    image_files = sorted(set(image_files))
     
     if not image_files:
         return {
+            **base_info,
             "has_preview": False,
-            "message": "No se encontraron imágenes renderizadas"
+            "message": "No se encontraron imágenes renderizadas",
+            "searched_in": [str(d) for d in possible_dirs if d.exists()]
         }
     
-    # Devolver información del primer archivo
+    # Información del primer archivo
     first_image = image_files[0]
+    
     return {
+        **base_info,
         "has_preview": True,
-        "preview_url": f"/api/v1/jobs/{job_id}/download",
-        "filename": first_image.name,
-        "file_size": first_image.stat().st_size,
-        "total_frames": len(image_files),
-        "output_dir": str(output_dir)
+        "preview_url": f"/api/v1/jobs/{job_id}/download-result",
+        "frames_url": f"/api/v1/jobs/{job_id}/frames",
+        "download_all_url": f"/api/v1/jobs/{job_id}/download-all",
+        "first_frame_filename": first_image.name,
+        "first_frame_size": first_image.stat().st_size,
+        "total_frames_available": len(image_files),
+        "output_dir": str(output_dir_found),
+        "all_frames": [
+            {
+                "filename": f.name,
+                "size": f.stat().st_size,
+                "url": f"/api/v1/jobs/{job_id}/download-result?frame={i+1}"
+            }
+            for i, f in enumerate(image_files[:5])  # Primeros 5 para preview
+        ]
     }
+
+
 
 @app.get("/api/v1/jobs/{job_id}/download-blend")
 async def download_blend_file(job_id: str):
@@ -2159,54 +2472,177 @@ async def download_blend_file(job_id: str):
         media_type="application/octet-stream"
     )
 
-@app.post("/api/v1/jobs/{job_id}/upload-result")
-async def upload_job_result(job_id: str, file: UploadFile = File(...)):
-    """Permite que un nodo suba un frame renderizado."""
+@app.get("/api/v1/jobs/{job_id}/debug")
+async def debug_job_status(job_id: str):
+    """Debug: Ver estado real del trabajo en memoria"""
     if job_id not in jobs_db:
-        raise HTTPException(status_code=404, detail="Trabajo no encontrado")
-
-    job_output_dir = OUTPUT_DIR / job_id
-    job_output_dir.mkdir(exist_ok=True)
-    file_path = job_output_dir / file.filename
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
+        # Mostrar trabajos disponibles
+        available_ids = list(jobs_db.keys())
+        return {
+            "error": "Trabajo no encontrado",
+            "job_id_searched": job_id,
+            "available_jobs": available_ids[:10],  # Primeros 10
+            "total_jobs": len(available_ids)
+        }
+    
     job = jobs_db[job_id]
-    job["frames_rendered"] = len(list(job_output_dir.glob("*.png")))
-    job["progress"] = min(int((job["frames_rendered"] / job["frames_total"]) * 100), 99)
+    
+    # Info detallada del estado
+    debug = {
+        "job_id": job_id,
+        "status": job.get("status"),
+        "status_type": type(job.get("status")).__name__,
+        "progress": job.get("progress"),
+        "frames_rendered": job.get("frames_rendered"),
+        "frames_total": job.get("frames_total"),
+        "completed_at": str(job.get("completed_at")),
+        "output_path": str(job.get("output_path")),
+        "all_keys": list(job.keys())
+    }
+    
+    # Verificar archivos de output
+    output_path = job.get("output_path")
+    if output_path:
+        output_dir = Path(output_path)
+        if output_dir.exists():
+            files = list(output_dir.glob("*.*"))
+            debug["output_files_found"] = len(files)
+            debug["output_files_sample"] = [f.name for f in files[:5]]
+        else:
+            debug["output_dir_exists"] = False
+    
+    return debug
 
-    print(f"🖼️ Frame '{file.filename}' recibido para el trabajo {job_id}")
-    return {"message": "Frame subido exitosamente", "filename": file.filename}
 
 @app.post("/api/v1/jobs/{job_id}/update-status")
 async def update_job_status_from_node(job_id: str, status_update: JobStatusUpdate):
-    """Permite que un nodo actualice el estado final de un trabajo."""
+    """Actualizar estado - PROTECCIÓN contra sobrescritura"""
     if job_id not in jobs_db:
-        print(f"⚠️ Se recibió actualización para un trabajo no encontrado: {job_id}")
-        return {"message": "Actualización recibida para trabajo no encontrado."}
+        return {"message": "Trabajo no encontrado"}
 
     job = jobs_db[job_id]
     
-    job.update({
-        "status": status_update.status,
-        "completed_at": datetime.now(),
-        "error_message": status_update.error_message
-    })
+    # ⚠️ PROTECCIÓN: NO sobrescribir si ya está completado
+    if job.get("status") == "completed":
+        print(f"ℹ️ Ignorando actualización: trabajo ya completado {job_id}")
+        return {"message": "Trabajo ya completado", "status": "completed"}
     
-    if job.get("started_at"):
-        duration = job["completed_at"] - job["started_at"]
-        job["render_time"] = str(duration).split('.')[0]
-
-    if status_update.status == "completed":
+    # Actualizar progreso
+    if status_update.progress is not None:
+        job["progress"] = status_update.progress
+    
+    if status_update.frames_rendered is not None:
+        job["frames_rendered"] = status_update.frames_rendered
+    
+    # Solo actualizar estado si NO es "failed" sin mensaje
+    new_status = status_update.status
+    error_msg = status_update.error_message
+    
+    if new_status == "failed":
+        if error_msg and len(str(error_msg).strip()) > 0:
+            job["status"] = "failed"
+            job["completed_at"] = datetime.now()
+            job["error_message"] = error_msg
+            print(f"❌ Trabajo {job_id} FALLIDO: {error_msg}")
+    elif new_status == "completed":
+        job["status"] = "completed"
+        job["completed_at"] = datetime.now()
         job["progress"] = 100
-        print(f"✅ Trabajo {job_id} marcado como COMPLETADO por el nodo.")
-    else:
-        print(f"❌ Trabajo {job_id} marcado como FALLIDO. Razón: {status_update.error_message}")
+    elif new_status in ["rendering", "processing", "in_progress"]:
+        if job["status"] not in ["completed", "failed", "cancelled"]:
+            job["status"] = "processing"
+    
+    return {"message": "Actualizado", "status": job["status"]}
 
-    return {"message": "Estado del trabajo actualizado exitosamente."}
 
+print("✅ Fix de emergencia aplicado - Reinicia el backend")
+
+
+@app.post("/api/v1/nodes/heartbeat")
+async def node_heartbeat(heartbeat_data: Dict[str, Any]):
+    """Recibe heartbeat de un nodo"""
+    try:
+        node_id = heartbeat_data.get("node_id")
+        if not node_id:
+            raise HTTPException(status_code=400, detail="Falta node_id")
+            
+        if node_id not in nodes_db:
+            raise HTTPException(
+                status_code=404, 
+                detail="Nodo no registrado. Regístrese de nuevo."
+            )
+        
+        # Actualizar
+        nodes_db[node_id]["last_seen"] = datetime.now()
+        nodes_db[node_id]["status"] = heartbeat_data.get("status", "online")
+        
+        if "system_stats" in heartbeat_data:
+            nodes_db[node_id]["system_stats"] = heartbeat_data["system_stats"]
+        
+        return {
+            "message": "Heartbeat recibido",
+            "server_time": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        print(f"Error en heartbeat: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ==================== RUTAS DE GESTIÓN DE NODOS ====================
+
+@app.post("/api/v1/jobs/{job_id}/force-complete")
+async def force_complete_job(job_id: str):
+    """Forzar completado de un trabajo atascado"""
+    if job_id not in jobs_db:
+        raise HTTPException(status_code=404, detail="Trabajo no encontrado")
+    
+    job = jobs_db[job_id]
+    
+    frames_rendered = job.get("frames_rendered", 0)
+    frames_total = job.get("frames_total", 0)
+    
+    print(f"🔧 Forzando completado de trabajo {job_id}")
+    print(f"   Estado actual: {job['status']}")
+    print(f"   Frames: {frames_rendered}/{frames_total}")
+    print(f"   Progreso: {job.get('progress')}%")
+    
+    # Verificar que realmente está completo
+    if frames_rendered != frames_total:
+        raise HTTPException(
+            status_code=400,
+            detail=f"El trabajo no está completo. Frames: {frames_rendered}/{frames_total}"
+        )
+    
+    # Forzar completado
+    job["status"] = "completed"
+    job["progress"] = 100
+    
+    if not job.get("completed_at"):
+        job["completed_at"] = datetime.now()
+    
+    # Calcular tiempo si falta
+    if job.get("started_at") and not job.get("render_time"):
+        started = job["started_at"]
+        if isinstance(started, str):
+            started = datetime.fromisoformat(started)
+        completed = job["completed_at"]
+        if isinstance(completed, str):
+            completed = datetime.fromisoformat(completed)
+        duration = completed - started
+        job["render_time"] = str(duration).split('.')[0]
+    
+    print(f"✅ Trabajo {job_id} forzado a COMPLETADO")
+    print(f"   Tiempo de render: {job.get('render_time')}")
+    
+    return {
+        "message": "Trabajo marcado como completado",
+        "job_id": job_id,
+        "status": job["status"],
+        "progress": job["progress"],
+        "frames": f"{frames_rendered}/{frames_total}",
+        "render_time": job.get("render_time")
+    }
+
 
 @app.post("/api/v1/nodes/register")
 async def register_node(node_data: Dict[str, Any]):
@@ -2441,30 +2877,42 @@ async def get_nodes():
 
 @app.get("/api/v1/stats/dashboard")
 async def get_dashboard_stats():
-    """Obtener estadísticas para el dashboard"""
+    """Estadísticas del dashboard - MEJORADO"""
     jobs = list(jobs_db.values())
     nodes = list(nodes_db.values())
     
-    # Calcular estadísticas
-    completed_jobs = [j for j in jobs if j["status"] == "completed"]
-    total_render_time = 0
+    # Contar por estado
+    pending = sum(1 for j in jobs if j.get("status") == "pending")
+    processing = sum(1 for j in jobs if j.get("status") == "processing")
+    completed = sum(1 for j in jobs if j.get("status") == "completed")
+    failed = sum(1 for j in jobs if j.get("status") == "failed")
     
-    for job in completed_jobs:
-        if job.get("render_time"):
-            # Calcular tiempo en segundos (aproximado)
-            total_render_time += 60  # Placeholder
+    # Nodos activos
+    current_time = datetime.now()
+    active_nodes = 0
+    for node in nodes:
+        last_seen = node.get("last_seen")
+        if isinstance(last_seen, str):
+            try:
+                last_seen = datetime.fromisoformat(last_seen)
+            except:
+                continue
+        if last_seen and (current_time - last_seen).total_seconds() < 120:
+            active_nodes += 1
     
     return {
         "total_jobs": len(jobs),
-        "active_jobs": len([j for j in jobs if j["status"] in ["processing", "pending"]]),
-        "completed_today": len([j for j in jobs if j["status"] == "completed"]),
-        "failed_jobs": len([j for j in jobs if j["status"] == "failed"]),
+        "active_jobs": pending + processing,
+        "completed_today": completed,
+        "failed_jobs": failed,
         "total_nodes": len(nodes),
-        "active_nodes": len([n for n in nodes if n["status"] == "online"]),
-        "total_render_time": f"{total_render_time // 3600}h {(total_render_time % 3600) // 60}m",
-        "queue_efficiency": 95 if completed_jobs else 0,
+        "active_nodes": active_nodes,
+        "total_render_time": "N/A",
+        "queue_efficiency": 95 if completed > 0 else 0,
         "blender_available": get_current_blender_path() is not None
     }
+
+print("✅ Fixes aplicados exitosamente")
 
 @app.get("/api/v1/system/blender-info")
 async def get_blender_info():
@@ -2582,6 +3030,95 @@ async def cleanup_old_sessions():
         except Exception as e:
             print(f"Error en tarea de limpieza: {e}")
             await asyncio.sleep(300)  # Reintentar en 5 minutos si hay error
+
+
+@app.get("/api/v1/jobs/{job_id}/has-results")
+async def check_job_has_results(job_id: str):
+    """
+    Verificar si un trabajo tiene resultados disponibles
+    Usado por el frontend para mostrar/ocultar botones
+    """
+    if job_id not in jobs_db:
+        raise HTTPException(status_code=404, detail="Trabajo no encontrado")
+    
+    job = jobs_db[job_id]
+    
+    # Verificar si hay archivos de output
+    has_files = False
+    file_count = 0
+    output_dir_path = None
+    
+    # Intentar encontrar directorio de output
+    possible_dirs = []
+    if job.get("output_path"):
+        possible_dirs.append(Path(job["output_path"]))
+    possible_dirs.append(OUTPUT_DIR / job_id)
+    
+    for output_dir in possible_dirs:
+        if output_dir.exists():
+            output_dir_path = str(output_dir)
+            # Buscar archivos de imagen
+            extensions = ["*.png", "*.jpg", "*.jpeg", "*.exr", "*.tiff", "*.tif"]
+            for ext in extensions:
+                files = list(output_dir.glob(ext))
+                file_count += len(files)
+            
+            if file_count > 0:
+                has_files = True
+                break
+    
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "has_results": has_files,
+        "file_count": file_count,
+        "output_dir": output_dir_path,
+        "frames_rendered": job.get("frames_rendered", 0),
+        "frames_total": job.get("frames_total", 0),
+        "progress": job.get("progress", 0),
+        "can_download": has_files,
+        "can_view_frames": has_files and file_count > 0,
+        "can_delete": True,
+        "is_completed": job["status"] == "completed"
+    }
+
+@app.get("/api/v1/jobs/{job_id}/debug-status")
+async def debug_job_status_detailed(job_id: str):
+    """Ver estado detallado de un trabajo para debugging"""
+    if job_id not in jobs_db:
+        raise HTTPException(status_code=404, detail="Trabajo no encontrado")
+    
+    job = jobs_db[job_id]
+    
+    # Contar archivos en disco
+    output_dir = OUTPUT_DIR / job_id
+    files_on_disk = 0
+    if output_dir.exists():
+        files_on_disk = len(list(output_dir.glob("*.png"))) + len(list(output_dir.glob("*.jpg")))
+    
+    # Listar archivos registrados
+    output_files = job.get("output_files", [])
+    registered_filenames = [f["filename"] for f in output_files]
+    
+    return {
+        "job_id": job_id,
+        "name": job.get("name"),
+        "status": job["status"],
+        "progress": job.get("progress"),
+        "frames_rendered": job.get("frames_rendered"),
+        "frames_total": job.get("frames_total"),
+        "output_files_count": len(output_files),
+        "files_on_disk": files_on_disk,
+        "match": len(output_files) == files_on_disk,
+        "registered_files": registered_filenames[:10],  # Primeros 10
+        "output_path": job.get("output_path"),
+        "started_at": str(job.get("started_at")),
+        "completed_at": str(job.get("completed_at")),
+        "render_time": job.get("render_time")
+    }
+
+
+print("✅ Fix definitivo de upload-result aplicado")
 
 # ==================== PUNTO DE ENTRADA ====================
 
