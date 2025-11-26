@@ -605,7 +605,20 @@ def get_system_stats():
             "memory_total": 0
         }
 
-nodes_db = {}
+nodes_db = {
+    "local": {
+        "id": "local",
+        "name": f"Local Machine ({platform.node()})",
+        "ip": "127.0.0.1",
+        "status": "online",
+        "cpu_usage": 0,
+        "memory_usage": 0,
+        "current_job": None,
+        "last_seen": datetime.now(),
+        "platform": platform.system(),
+        "blender_available": False
+    }
+}
 
 # Almacén temporal para chunks
 upload_sessions: Dict[str, dict] = {}
@@ -2007,9 +2020,8 @@ async def complete_chunked_upload(
         del upload_sessions[session_id]
         
         # Iniciar render
-        # background_tasks.add_task(render_job_background, job_id)
-        print(f"✅ Trabajo {job_id} creado y en espera de un nodo.")
-
+        background_tasks.add_task(render_job_background, job_id)
+        
         return {
             "message": "Upload completado exitosamente",
             "job_id": job_id,
@@ -2434,10 +2446,29 @@ async def get_queue_status():
 
 @app.get("/api/v1/nodes", response_model=List[dict])
 async def get_nodes():
-    """Obtener lista de todos los nodos registrados"""
-    # Ya no intentamos actualizar 'local' porque no existe.
-    # Solo devolvemos los nodos que se han registrado (como tu worker).
-    return list(nodes_db.values())
+    """Obtener lista de todos los nodos con información actualizada"""
+    
+    # Actualizar información del nodo local
+    system_stats = get_system_stats()
+    current_blender = get_current_blender_path()
+    
+    nodes_db["local"].update({
+        "name": f"Local Machine ({platform.node()})",
+        "last_seen": datetime.now(),
+        "cpu_usage": system_stats["cpu_usage"],
+        "memory_usage": system_stats["memory_usage"],
+        "platform": platform.system(),
+        "blender_available": current_blender is not None,
+        "blender_version": verify_blender_path(current_blender).get("version") if current_blender else None,
+        "system_info": {
+            "cpu_cores": psutil.cpu_count(),
+            "memory_total_gb": round(system_stats["memory_total"] / (1024**3), 1),
+            "memory_available_gb": round(system_stats["memory_available"] / (1024**3), 1)
+        }
+    })
+    
+    nodes = list(nodes_db.values())
+    return nodes
 
 @app.get("/api/v1/stats/dashboard")
 async def get_dashboard_stats():
