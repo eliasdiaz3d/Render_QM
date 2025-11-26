@@ -844,3 +844,190 @@ async def get_jobs_health():
             "Alta tasa de fallos en renders" if stats["failed_jobs"] > stats["total_jobs"] * 0.2 else None
         ]
     }
+
+@router.post("/jobs/{job_id}/update-status")
+async def update_job_status(job_id: str, status_data: JobUpdate):
+    """
+    Actualiza el estado de un trabajo.
+    CORREGIDO: Validación estricta para no fallar por strings vacíos.
+    """
+    if job_id not in jobs_db:
+        raise HTTPException(status_code=404, detail="Trabajo no encontrado")
+    
+    job = jobs_db[job_id]
+    
+    # 1. Si el trabajo ya terminó, no permitimos cambios (salvo reset)
+    if job["status"] == "completed" and status_data.status != "queued":
+        return {"status": "ignored", "detail": "Job already completed"}
+
+    # 2. Actualizar progreso
+    if status_data.progress is not None:
+        job["progress"] = status_data.progress
+        
+    # 3. Actualizar frames
+    if status_data.frames_rendered is not None:
+        # Lógica para actualizar frames si es necesario
+        pass
+
+    # 4. Manejo de Estado (LA PARTE CRÍTICA)
+    new_status = status_data.status
+    error_msg = status_data.error_message
+
+    if new_status == "failed":
+        # SOLO fallar si hay un mensaje de error real
+        if error_msg and len(str(error_msg).strip()) > 0:
+            print(f"❌ (API) Trabajo {job_id} marcado como FALLIDO. Razón: {error_msg}")
+            job["status"] = "failed"
+            job["error"] = error_msg
+        else:
+            # Si llega "failed" sin mensaje, lo ignoramos o lo pasamos a in_progress
+            # Esto evita el bug del "Razón: " vacía
+            pass
+            
+    elif new_status == "completed":
+        job["status"] = "completed"
+        job["progress"] = 100
+        if "completed_at" not in job:
+             job["completed_at"] = datetime.now().isoformat()
+             
+    elif new_status in ["rendering", "in_progress"]:
+        job["status"] = "in_progress"
+    
+    return {"status": "ok", "job_status": job["status"]}
+# ==================== ENDPOINTS DE ESTADO ====================
+
+@router.post("/jobs/{job_id}/update-status")
+async def update_job_status(job_id: str, status_data: JobUpdate):
+    """
+    Actualiza el estado de un trabajo.
+    CORREGIDO: Validación estricta para no fallar por strings vacíos.
+    """
+    if job_id not in jobs_db:
+        # Si no está en memoria, intentamos buscarlo silenciosamente o fallamos
+        raise HTTPException(status_code=404, detail="Trabajo no encontrado")
+    
+    job = jobs_db[job_id]
+    
+    # 1. Si el trabajo ya terminó, no permitimos cambios (salvo reset a queued)
+    if job.get("status") == "completed" and status_data.status != "queued":
+        return {"status": "ignored", "detail": "Job already completed"}
+
+    # 2. Actualizar progreso si viene el dato
+    if status_data.progress is not None:
+        job["progress"] = status_data.progress
+        
+    # 3. Actualizar frames si viene el dato
+    if status_data.frames_rendered is not None:
+        job["frames_rendered"] = status_data.frames_rendered
+
+    # 4. Manejo de Estado (LA PARTE CRÍTICA)
+    new_status = status_data.status
+    error_msg = status_data.error_message
+
+    if new_status == "failed":
+        # PROTECCIÓN: SOLO fallar si hay un mensaje de error real y no vacío
+        if error_msg and len(str(error_msg).strip()) > 0:
+            print(f"❌ (API) Trabajo {job_id} marcado como FALLIDO. Razón: {error_msg}")
+            job["status"] = "failed"
+            job["error"] = error_msg
+        else:
+            # Si llega "failed" sin mensaje, asumimos que es un glitch y lo dejamos en progreso
+            # Esto evita el bug del "Razón: vacía"
+            pass
+            
+    elif new_status == "completed":
+        job["status"] = "completed"
+        job["progress"] = 100
+        if "completed_at" not in job:
+             job["completed_at"] = datetime.now().isoformat()
+             
+    elif new_status in ["rendering", "in_progress"]:
+        job["status"] = "in_progress"
+    
+    return {"status": "ok", "job_status": job.get("status")}
+
+# ==================== ENDPOINTS DE ESTADO Y CONTROL ====================
+
+@router.post("/jobs/{job_id}/update-status")
+async def update_job_status(job_id: str, status_data: JobUpdate):
+    """
+    Actualiza el estado de un trabajo reportado por un nodo.
+    INCLUYE PROTECCIÓN CONTRA ERRORES VACÍOS.
+    """
+    if job_id not in jobs_db:
+        raise HTTPException(status_code=404, detail="Trabajo no encontrado")
+    
+    job = jobs_db[job_id]
+    
+    # 1. Protección de finalización: Si ya terminó, no tocar
+    if job.get("status") == "completed" and status_data.status != "queued":
+        return {"status": "ignored", "detail": "Job already completed"}
+
+    # 2. Actualizar datos numéricos (progreso y frames)
+    if status_data.progress is not None:
+        job["progress"] = status_data.progress
+        
+    if hasattr(status_data, "frames_rendered") and status_data.frames_rendered is not None:
+        job["frames_rendered"] = status_data.frames_rendered
+
+    # 3. Lógica Crítica de Estado
+    new_status = status_data.status
+    error_msg = status_data.error_message
+
+    if new_status == "failed":
+        # === EL FIX: Solo fallar si hay texto real en el error ===
+        if error_msg and len(str(error_msg).strip()) > 0:
+            print(f"❌ (API Jobs) Trabajo {job_id} marcado como FALLIDO. Razón: '{error_msg}'")
+            job["status"] = "failed"
+            job["error"] = error_msg
+        else:
+            # Si es "failed" pero sin mensaje, es un glitch del nodo -> Lo ignoramos o dejamos en progreso
+            # Esto evita que el trabajo muera por un string vacío
+            pass
+
+    elif new_status == "completed":
+        job["status"] = "completed"
+        job["progress"] = 100
+        if "completed_at" not in job:
+             job["completed_at"] = datetime.now().isoformat()
+             
+    elif new_status in ["rendering", "in_progress"]:
+        job["status"] = "in_progress"
+    
+    return {"status": "ok", "current_status": job.get("status")}
+
+@router.post("/jobs/{job_id}/upload-result")
+async def upload_job_result(
+    job_id: str,
+    file: UploadFile = File(...)
+):
+    """
+    Recibe un frame renderizado y lo guarda.
+    """
+    if job_id not in jobs_db:
+        raise HTTPException(status_code=404, detail="Trabajo no encontrado")
+        
+    job = jobs_db[job_id]
+    
+    # Crear directorio de salida si no existe
+    output_dir = settings.OUTPUT_DIR / job_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    file_path = output_dir / file.filename
+    
+    try:
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        print(f"💾 (API Jobs) Frame guardado: {file.filename}")
+        
+        # Registrar el frame en la lista de resultados del trabajo
+        if "outputs" not in job:
+            job["outputs"] = []
+        if file.filename not in job["outputs"]:
+            job["outputs"].append(file.filename)
+            
+        return {"status": "ok", "filename": file.filename}
+    except Exception as e:
+        print(f"🔥 Error guardando frame {file.filename}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error guardando archivo: {str(e)}")

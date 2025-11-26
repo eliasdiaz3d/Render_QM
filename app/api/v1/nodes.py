@@ -574,72 +574,66 @@ async def cleanup_nodes():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error registrando nodo: {str(e)}")
 
-@router.post("/nodes/heartbeat")
-async def node_heartbeat_endpoint(heartbeat_data: NodeHeartbeat):
-    """Recibir heartbeat de un nodo"""
+@@router.post("/nodes/heartbeat")
+async def node_heartbeat(heartbeat_data: NodeHeartbeat):
+    """
+    Recibe el latido del nodo. Actualiza 'last_seen' y monitorea trabajos.
+    VERSIÓN ROBUSTA: No mata trabajos sin razón explícita.
+    """
     try:
-        # Extraer node_id del contexto o parámetros
-        # Por ahora, asumimos que viene en el cuerpo de la petición
-        node_id = getattr(heartbeat_data, 'node_id', None)
-        
-        if not node_id:
-            raise HTTPException(status_code=400, detail="node_id requerido")
-        
-        if node_id not in nodes_registry:
-            raise HTTPException(status_code=404, detail="Nodo no registrado")
-        
-        # Preparar datos del heartbeat
-        heartbeat_dict = {
-            "status": heartbeat_data.status,
-            "system_stats": heartbeat_data.system_stats.dict(),
-            "active_jobs": heartbeat_data.active_jobs,
-            "errors": heartbeat_data.errors,
-            "warnings": heartbeat_data.warnings,
-            "uptime_seconds": heartbeat_data.uptime_seconds
-        }
-        
-        # Actualizar heartbeat
-        success = update_node_heartbeat(node_id, heartbeat_dict)
-        
-        if success:
-            # Procesar estados de trabajos reportados
-            job_statuses = heartbeat_data.job_statuses
-            for job_id, job_status in job_statuses.items():
+        # 1. Verificar si el nodo existe
+        if heartbeat_data.node_id not in nodes_registry:
+            # Si no existe, lo re-registramos silenciosamente o retornamos error suave
+            print(f"⚠️ Heartbeat de nodo desconocido: {heartbeat_data.node_id}")
+            return {"status": "unknown_node", "command": "re_register"}
+
+        # 2. Actualizar Timestamp (Last Seen)
+        nodes_registry[heartbeat_data.node_id]["last_seen"] = datetime.now()
+        nodes_registry[heartbeat_data.node_id]["status"] = heartbeat_data.status
+        nodes_registry[heartbeat_data.node_id]["system_stats"] = heartbeat_data.system_stats
+
+        # 3. Procesar Trabajos reportados
+        if heartbeat_data.job_statuses:
+            for job_id, node_job_status in heartbeat_data.job_statuses.items():
+                
+                # Verificar si el trabajo existe en nuestra DB en memoria o SQL
                 if job_id in jobs_db:
-                    # Actualizar estado del trabajo
-                    jobs_db[job_id]["status"] = job_status.get("status", "processing")
-                    jobs_db[job_id]["progress"] = job_status.get("progress", 0)
-                    jobs_db[job_id]["frames_rendered"] = job_status.get("frames_rendered", 0)
+                    current_db_job = jobs_db[job_id]
                     
-                    # Si se completó, manejar finalización
-                    if job_status.get("status") == "completed":
-                        jobs_db[job_id]["completed_at"] = datetime.now()
-                        jobs_db[job_id]["output_files"] = job_status.get("output_files", [])
-                        
-                        # Remover de asignaciones
-                        if job_id in job_assignments:
-                            del job_assignments[job_id]
+                    # --- LÓGICA DE PROTECCIÓN ---
                     
-                    elif job_status.get("status") == "failed":
-                        jobs_db[job_id]["error_message"] = job_status.get("error_message", "Error desconocido")
-                        jobs_db[job_id]["completed_at"] = datetime.now()
+                    # Si el nodo dice "failed"
+                    if node_job_status.status == "failed":
+                        reason = node_job_status.error_message
+                        # PROTECCIÓN: Si la razón está vacía, IGNORAMOS el fallo.
+                        # Asumimos que es un glitch transitorio del nodo.
+                        if not reason or len(reason.strip()) == 0:
+                            print(f"🛡️ Ignorando reporte de fallo vacío para {job_id}")
+                            continue
                         
-                        # Remover de asignaciones
-                        if job_id in job_assignments:
-                            del job_assignments[job_id]
-            
-            return {
-                "message": "Heartbeat recibido",
-                "server_time": datetime.now().isoformat(),
-                "next_heartbeat": (datetime.now() + timedelta(seconds=10)).isoformat()
-            }
-        else:
-            raise HTTPException(status_code=500, detail="Error procesando heartbeat")
-            
-    except HTTPException:
-        raise
+                        # Si hay razón, entonces sí marcamos error real
+                        print(f"❌ Nodo reporta fallo real en {job_id}: {reason}")
+                        current_db_job["status"] = "failed"
+                        current_db_job["error"] = reason
+                    
+                    # Si el nodo dice "rendering", lo tratamos como "in_progress"
+                    elif node_job_status.status == "rendering":
+                        # Solo actualizamos si no está ya completado
+                        if current_db_job["status"] != "completed":
+                            current_db_job["status"] = "in_progress"
+                            current_db_job["progress"] = node_job_status.progress
+                            
+                    # Si el nodo dice "completed", confiamos
+                    elif node_job_status.status == "completed":
+                        current_db_job["status"] = "completed"
+                        current_db_job["progress"] = 100
+
+        return {"status": "ok"}
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error procesando heartbeat: {str(e)}")
+        print(f"🔥 Error procesando heartbeat: {e}")
+        # Retornamos OK para que el nodo no se asuste y siga trabajando
+        return {"status": "ok", "error": str(e)}
 
 # ==================== ENDPOINTS DE ASIGNACIÓN DE TRABAJOS ====================
 

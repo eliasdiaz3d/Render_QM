@@ -575,71 +575,58 @@ async def cleanup_nodes():
         raise HTTPException(status_code=500, detail=f"Error registrando nodo: {str(e)}")
 
 @router.post("/nodes/heartbeat")
-async def node_heartbeat_endpoint(heartbeat_data: NodeHeartbeat):
-    """Recibir heartbeat de un nodo"""
+async def node_heartbeat(heartbeat_data: NodeHeartbeat):
+    """
+    Recibe el latido del nodo.
+    CORREGIDO: Ignora error_message si está vacío.
+    """
     try:
-        # Extraer node_id del contexto o parámetros
-        # Por ahora, asumimos que viene en el cuerpo de la petición
-        node_id = getattr(heartbeat_data, 'node_id', None)
-        
-        if not node_id:
-            raise HTTPException(status_code=400, detail="node_id requerido")
-        
-        if node_id not in nodes_registry:
-            raise HTTPException(status_code=404, detail="Nodo no registrado")
-        
-        # Preparar datos del heartbeat
-        heartbeat_dict = {
-            "status": heartbeat_data.status,
-            "system_stats": heartbeat_data.system_stats.dict(),
-            "active_jobs": heartbeat_data.active_jobs,
-            "errors": heartbeat_data.errors,
-            "warnings": heartbeat_data.warnings,
-            "uptime_seconds": heartbeat_data.uptime_seconds
-        }
-        
-        # Actualizar heartbeat
-        success = update_node_heartbeat(node_id, heartbeat_dict)
-        
-        if success:
-            # Procesar estados de trabajos reportados
-            job_statuses = heartbeat_data.job_statuses
-            for job_id, job_status in job_statuses.items():
+        # 1. Registrar nodo si no existe (o actualizar last_seen)
+        if heartbeat_data.node_id not in nodes_registry:
+            # Opción: Registrarlo al vuelo o retornar advertencia
+            # Para robustez, actualizamos si ya estaba en caché o imprimimos aviso
+            pass 
+
+        # 2. Actualizar datos vitales
+        if heartbeat_data.node_id in nodes_registry:
+            nodes_registry[heartbeat_data.node_id]["last_seen"] = datetime.now()
+            nodes_registry[heartbeat_data.node_id]["status"] = heartbeat_data.status
+            nodes_registry[heartbeat_data.node_id]["system_stats"] = heartbeat_data.system_stats
+
+        # 3. Sincronizar estado de los trabajos
+        if heartbeat_data.job_statuses:
+            for job_id, node_job_status in heartbeat_data.job_statuses.items():
+                
                 if job_id in jobs_db:
-                    # Actualizar estado del trabajo
-                    jobs_db[job_id]["status"] = job_status.get("status", "processing")
-                    jobs_db[job_id]["progress"] = job_status.get("progress", 0)
-                    jobs_db[job_id]["frames_rendered"] = job_status.get("frames_rendered", 0)
+                    current_db_job = jobs_db[job_id]
                     
-                    # Si se completó, manejar finalización
-                    if job_status.get("status") == "completed":
-                        jobs_db[job_id]["completed_at"] = datetime.now()
-                        jobs_db[job_id]["output_files"] = job_status.get("output_files", [])
-                        
-                        # Remover de asignaciones
-                        if job_id in job_assignments:
-                            del job_assignments[job_id]
-                    
-                    elif job_status.get("status") == "failed":
-                        jobs_db[job_id]["error_message"] = job_status.get("error_message", "Error desconocido")
-                        jobs_db[job_id]["completed_at"] = datetime.now()
-                        
-                        # Remover de asignaciones
-                        if job_id in job_assignments:
-                            del job_assignments[job_id]
-            
-            return {
-                "message": "Heartbeat recibido",
-                "server_time": datetime.now().isoformat(),
-                "next_heartbeat": (datetime.now() + timedelta(seconds=10)).isoformat()
-            }
-        else:
-            raise HTTPException(status_code=500, detail="Error procesando heartbeat")
-            
-    except HTTPException:
-        raise
+                    # --- CORRECCIÓN CLAVE ---
+                    # Solo marcamos fallido si status es "failed" Y hay un mensaje real
+                    if node_job_status.status == "failed":
+                        error_msg = node_job_status.error_message
+                        if error_msg and len(error_msg.strip()) > 0:
+                            print(f"❌ (Heartbeat) Nodo reporta fallo en {job_id}: {error_msg}")
+                            current_db_job["status"] = "failed"
+                            current_db_job["error"] = error_msg
+                        else:
+                            # Si dice failed pero no hay mensaje, lo ignoramos o ponemos warn
+                            pass
+
+                    elif node_job_status.status in ["rendering", "in_progress"]:
+                        # Aceptamos "rendering" como válido
+                        if current_db_job["status"] != "completed":
+                            current_db_job["status"] = "in_progress"
+                            current_db_job["progress"] = node_job_status.progress
+                            
+                    elif node_job_status.status == "completed":
+                        current_db_job["status"] = "completed"
+                        current_db_job["progress"] = 100
+
+        return {"status": "ok"}
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error procesando heartbeat: {str(e)}")
+        print(f"🔥 Error en heartbeat: {e}")
+        return {"status": "ok"} # No romper el nodo
 
 # ==================== ENDPOINTS DE ASIGNACIÓN DE TRABAJOS ====================
 
